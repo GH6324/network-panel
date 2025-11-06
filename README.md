@@ -2,7 +2,7 @@
 
 ## 更新记录
 - 2025-11-06 迁移页新增“真·进度条”，实时显示表级进度
-             增加了SQLLite支持，需设置DB_DIALECT环境变量为sqlite，默认为mysql
+             增加了SQLLite支持，需设置DB_DIALECT环境变量为sqlite，默认为mysql  
              Agent 自升级功能上线
 - 2025-11-05 增加探针功能，现在可以看网络延迟和掉线情况了
 
