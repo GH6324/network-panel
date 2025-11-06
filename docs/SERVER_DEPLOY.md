@@ -67,7 +67,7 @@ sudo journalctl -u flux-panel -f
 
 1）准备环境与变量
 - 确保 Docker 与 Docker Compose 可用
-- 准备 `.env` 文件（样例变量参考 `panel_install.sh` 交互生成），至少包括：
+- 准备 `.env` 文件，至少包括：
   - 面板访问域名/端口
   - 数据库相关变量（DB_HOST/DB_NAME/DB_USER/DB_PASSWORD）
 
