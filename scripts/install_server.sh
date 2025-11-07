@@ -188,25 +188,61 @@ install_flux_agents() {
     done
   fi
 
-  # 2) Fetch missing from GitHub Releases latest
-  local base="https://github.com/NiuStar/network-panel/releases/latest/download"
-  if [[ -n "$PROXY_PREFIX" ]]; then base="${PROXY_PREFIX}${base}"; fi
-  for f in "${need[@]}"; do
-    if [[ ! -f "$outdir/$f" ]]; then
-      local url="$base/$f"
-      log "Downloading flux-agent: $f"
-      # Capture HTTP code for better error messages
-      local http_code
-      http_code=$(curl -fSL --retry 3 --retry-delay 1 --write-out '%{http_code}' --output "$outdir/$f" "$url" 2>/dev/null || true)
-      if [[ -s "$outdir/$f" && ( "$http_code" == "200" || "$http_code" == "302" || "$http_code" == "000" ) ]]; then
-        chmod +x "$outdir/$f"
-        have_any=1
-        log "✅ downloaded $f to $outdir/$f"
-      else
-        rm -f "$outdir/$f" 2>/dev/null || true
-        log "❌ failed to download $f from $url (HTTP ${http_code:-unknown})"
-      fi
+  # Helper to try a URL and report HTTP code
+  try_dl() {
+    # try_dl <url> <dest>
+    local url="$1"; local dest="$2"; local code
+    code=$(curl -fSL --retry 2 --retry-delay 1 --write-out '%{http_code}' --output "$dest" "$url" 2>/dev/null || true)
+    if [[ -s "$dest" && ( "$code" == "200" || "$code" == "302" || "$code" == "000" ) ]]; then
+      chmod +x "$dest" 2>/dev/null || true
+      printf 'OK %s\n' "$code"
+      return 0
     fi
+    rm -f "$dest" 2>/dev/null || true
+    printf 'ERR %s\n' "${code:-unknown}"
+    return 1
+  }
+
+  # 2) Fetch missing from GitHub Releases latest (auto-detect asset names via API) with fallbacks
+  local api="https://api.github.com/repos/NiuStar/network-panel/releases/latest"
+  local dlbase="https://github.com/NiuStar/network-panel/releases/latest/download"
+  if [[ -n "$PROXY_PREFIX" ]]; then
+    api="${PROXY_PREFIX}${api}"
+    dlbase="${PROXY_PREFIX}${dlbase}"
+  fi
+  local api_body
+  api_body=$(curl -fsSL "$api" || true)
+
+  for f in "${need[@]}"; do
+    if [[ -f "$outdir/$f" ]]; then continue; fi
+    log "Downloading flux-agent: $f"
+    local url1 url2 url3
+    # Try to discover exact asset name from API (no jq dependency)
+    # Grep lines containing browser_download_url and the arch token
+    case "$f" in
+      *amd64) token="amd64" ;;
+      *arm64) token="arm64" ;;
+      *armv7) token="armv7|armv7l" ;;
+      *) token="" ;;
+    esac
+    if [[ -n "$api_body" ]]; then
+      url1=$(printf '%s\n' "$api_body" | grep -oE '"browser_download_url"\s*:\s*"[^"]+"' | grep -E "flux-agent.*(linux-($token))" | head -n1 | sed -E 's/.*"(http[^"]+)".*/\1/')
+    fi
+    # Fallback to canonical name under releases/download
+    url2="${dlbase}/$f"
+    # Final fallback: raw repo path at HEAD
+    url3="https://raw.githubusercontent.com/NiuStar/network-panel/refs/heads/main/golang-backend/public/flux-agent/$f"
+    if [[ -n "$PROXY_PREFIX" ]]; then url3="${PROXY_PREFIX}${url3}"; fi
+
+    local dest="$outdir/$f"; local res
+    if [[ -n "$url1" ]]; then
+      res=$(try_dl "$url1" "$dest") || log "❌ failed $f from $url1 ($(printf '%s' "$res" | awk '{print $2}'))"
+      if [[ "$res" == OK* ]]; then have_any=1; log "✅ downloaded $f via API asset"; continue; fi
+    fi
+    res=$(try_dl "$url2" "$dest") || log "❌ failed $f from $url2 ($(printf '%s' "$res" | awk '{print $2}'))"
+    if [[ "$res" == OK* ]]; then have_any=1; log "✅ downloaded $f via latest/download"; continue; fi
+    res=$(try_dl "$url3" "$dest") || log "❌ failed $f from $url3 ($(printf '%s' "$res" | awk '{print $2}'))"
+    if [[ "$res" == OK* ]]; then have_any=1; log "✅ downloaded $f via raw repo"; continue; fi
   done
 
   if (( have_any == 1 )); then
