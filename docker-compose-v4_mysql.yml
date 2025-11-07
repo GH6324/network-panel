@@ -23,7 +23,7 @@ services:
       retries: 10
       
   backend:
-    image: 24802117/flux-panel:latest
+    image: 24802117/network-panel:latest
     container_name: network-panel
     restart: unless-stopped
     environment:
