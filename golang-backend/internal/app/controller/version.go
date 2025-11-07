@@ -14,14 +14,14 @@ func Version(c *gin.Context) {
 	// server.version from main package
 	serverVer := appver.Get()
 	// agent version (expected agent binary baseline)
-	agentVer := os.Getenv("AGENT_VERSION")
-	if agentVer == "" {
-		agentVer = "go-agent-1.0.0"
-	}
-	agent2Ver := os.Getenv("AGENT2_VERSION")
-	if agent2Ver == "" {
-		agent2Ver = "go-agent2-1.0.0"
-	}
+    agentVer := os.Getenv("AGENT_VERSION")
+    if agentVer == "" {
+        agentVer = "go-agent-1.0.1"
+    }
+    agent2Ver := os.Getenv("AGENT2_VERSION")
+    if agent2Ver == "" {
+        agent2Ver = "go-agent2-1.0.1"
+    }
 	c.JSON(http.StatusOK, response.Ok(map[string]string{
 		"server": serverVer,
 		"agent":  agentVer,

@@ -33,7 +33,7 @@ var (
 
 // versionBase is the agent semantic version (without role prefix).
 // final reported version is: go-agent-<versionBase> or go-agent2-<versionBase>
-var versionBase = "1.0.0"
+var versionBase = "1.0.1"
 var version = "" // computed in main()
 
 func isAgent2Binary() bool {
@@ -168,7 +168,8 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 	go reconcile(addr, secret, scheme)
 	go periodicReconcile(addr, secret, scheme)
 	go periodicProbe(addr, secret, scheme)
-	go periodicSystemInfo(c)
+    go periodicSystemInfo(c)
+    go periodicEnsureGost()
 	// after connect, cross-check counterpart agent
 	go func() {
 		// fetch expected versions
@@ -1352,4 +1353,47 @@ func download(url, dest string) error {
 	defer f.Close()
 	_, err = io.Copy(f, resp.Body)
 	return err
+}
+
+// --- ensure gost.service stays running ---
+func periodicEnsureGost() {
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
+    for range ticker.C {
+        active, known := isServiceActive("gost")
+        if !known {
+            // service manager unavailable or service not installed; skip
+            continue
+        }
+        if active {
+            continue
+        }
+        // try restart when inactive
+        if tryRestartService("gost") {
+            log.Printf("{\"event\":\"gost_autorestart\",\"status\":\"restarted\"}")
+        } else {
+            log.Printf("{\"event\":\"gost_autorestart\",\"status\":\"failed\"}")
+        }
+    }
+}
+
+// isServiceActive checks if a service is active via systemctl/service.
+// returns (active, known). known=false if neither manager exists or status unknown.
+func isServiceActive(name string) (bool, bool) {
+    if _, err := exec.LookPath("systemctl"); err == nil {
+        // is-active --quiet exits 0 when active
+        if err := exec.Command("systemctl", "is-active", "--quiet", name).Run(); err == nil {
+            return true, true
+        }
+        // If systemctl can run, we consider it authoritative even if inactive
+        return false, true
+    }
+    if _, err := exec.LookPath("service"); err == nil {
+        // service <name> status returns 0 when running on many distros
+        if err := exec.Command("service", name, "status").Run(); err == nil {
+            return true, true
+        }
+        return false, true
+    }
+    return false, false
 }
