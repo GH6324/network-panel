@@ -254,7 +254,7 @@ ADDR=
 # 节点密钥，为空则默认读取 /etc/gost/config.json 的 secret
 SECRET=
 # WebSocket 协议：ws 或 wss
-SCHEME=wss
+SCHEME=ws
 EOF
   fi
 
