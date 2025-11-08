@@ -101,12 +101,16 @@ func RegisterRoutes(r *gin.Engine) {
 			adm.POST("/list", controller.TunnelList)
 			adm.POST("/update", controller.TunnelUpdate)
 			adm.POST("/delete", controller.TunnelDelete)
+			adm.POST("/path/get", controller.TunnelPathGet)
+			adm.POST("/path/set", controller.TunnelPathSet)
 			adm.POST("/user/assign", controller.TunnelUserAssign)
 			adm.POST("/user/list", controller.TunnelUserList)
 			adm.POST("/user/remove", controller.TunnelUserRemove)
 			adm.POST("/user/update", controller.TunnelUserUpdate)
 			adm.POST("/diagnose", controller.TunnelDiagnose)
 			adm.POST("/diagnose-step", controller.TunnelDiagnoseStep)
+			adm.POST("/path-check", controller.TunnelPathCheck)
+			adm.POST("/cleanup-temp", controller.TunnelCleanupTemp)
 		}
 	}
 

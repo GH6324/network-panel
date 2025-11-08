@@ -48,6 +48,11 @@ export const updateTunnel = (data: any) => Network.post("/tunnel/update", data);
 export const deleteTunnel = (id: number) => Network.post("/tunnel/delete", { id });
 export const diagnoseTunnel = (tunnelId: number) => Network.post("/tunnel/diagnose", { tunnelId });
 export const diagnoseTunnelStep = (tunnelId: number, step: string) => Network.post("/tunnel/diagnose-step", { tunnelId, step });
+// 隧道多级路径配置
+export const getTunnelPath = (tunnelId: number) => Network.post("/tunnel/path/get", { tunnelId });
+export const setTunnelPath = (tunnelId: number, path: number[]) => Network.post("/tunnel/path/set", { tunnelId, path });
+export const checkTunnelPath = (tunnelId: number) => Network.post("/tunnel/path-check", { tunnelId });
+export const cleanupTunnelTemp = (tunnelId: number) => Network.post("/tunnel/cleanup-temp", { tunnelId });
 
 // 用户隧道权限管理操作 - 全部使用POST请求
 export const assignUserTunnel = (data: any) => Network.post("/tunnel/user/assign", data);

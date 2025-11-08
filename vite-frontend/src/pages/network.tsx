@@ -166,7 +166,7 @@ export default function NetworkPage() {
         ))}
         {!params.id && (
           <Button size="sm" variant="flat" onPress={async ()=>{
-            const url = (window.location?.origin || '') + '/share/network';
+            const url = (window.location?.origin || '') + '/app/share/network';
             try { await navigator.clipboard.writeText(url); toast.success('分享链接已复制'); } catch { toast.error('复制失败：'+url); }
           }}>分享</Button>
         )}

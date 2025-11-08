@@ -19,7 +19,7 @@ func main() {
 	if err := dbpkg.Init(); err != nil {
 		log.Fatalf("db init error: %v", err)
 	}
-	// start schedulers
+	// start schedulerRs
 	scheduler.Start()
 
 	r := gin.Default()

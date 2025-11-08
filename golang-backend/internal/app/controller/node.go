@@ -1,8 +1,9 @@
 package controller
 
 import (
-	"net/http"
-	"time"
+    "net/http"
+    "time"
+    "fmt"
 
 	"github.com/gin-gonic/gin"
 	"network-panel/golang-backend/internal/app/dto"
@@ -224,9 +225,4 @@ func wrapIPv6(hostport string) string {
 	return "[" + hostport[:last] + "]" + hostport[last:]
 }
 
-func RandUUID() string { return randUUID() }
-
-var randUUID = func() string {
-	// simple fallback UUID-like
-	return time.Now().Format("20060102150405")
-}
+func RandUUID() string { return fmt.Sprintf("%d", time.Now().UnixNano()) }

@@ -33,7 +33,7 @@ var (
 
 // versionBase is the agent semantic version (without role prefix).
 // final reported version is: go-agent-<versionBase> or go-agent2-<versionBase>
-var versionBase = "1.0.2"
+var versionBase = "1.0.4"
 var version = "" // computed in main()
 
 func isAgent2Binary() bool {
@@ -348,6 +348,8 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 			go func() { _ = upgradeAgent1(addr, scheme, "") }()
 		case "UpgradeAgent2":
 			go func() { _ = upgradeAgent2(addr, scheme, "") }()
+		case "RestartGost":
+			go func() { _ = restartGostService() }()
 		case "UninstallAgent":
 			go func() {
 				_ = uninstallSelf()
@@ -690,7 +692,8 @@ func handleDiagnose(c *websocket.Conn, d *DiagnoseData) {
 			if d.Duration <= 0 {
 				d.Duration = 5
 			}
-			bw := runIperf3Client(d.Host, d.Port, d.Duration)
+			// allow reverse mode via payload Reverse flag
+			bw := runIperf3Client(d.Host, d.Port, d.Duration, d.Reverse)
 			ok := bw > 0
 			resp = map[string]any{"success": ok, "bandwidthMbps": bw, "ctx": d.Ctx}
 		} else {
@@ -1083,11 +1086,14 @@ func startIperf3Server(port int) bool {
 	return err == nil
 }
 
-func runIperf3Client(host string, port, duration int) float64 {
+func runIperf3Client(host string, port, duration int, reverse bool) float64 {
 	if host == "" || port <= 0 {
 		return 0
 	}
-	args := []string{"-J", "-R", "-c", host, "-p", fmt.Sprintf("%d", port), "-t", fmt.Sprintf("%d", duration)}
+	args := []string{"-J", "-c", host, "-p", fmt.Sprintf("%d", port), "-t", fmt.Sprintf("%d", duration)}
+	if reverse {
+		args = append(args, "-R")
+	}
 	out, err := exec.Command("iperf3", args...).CombinedOutput()
 	if err != nil {
 		return 0
@@ -1389,6 +1395,15 @@ func uninstallSelf() error {
 	// exit process
 	os.Exit(0)
 	return nil
+}
+
+func restartGostService() error {
+	if tryRestartService("gost") {
+		log.Printf("{\"event\":\"gost_restarted\"}")
+		return nil
+	}
+	log.Printf("{\"event\":\"gost_restart_failed\"}")
+	return fmt.Errorf("restart gost failed")
 }
 
 // --- ensure gost.service stays running ---

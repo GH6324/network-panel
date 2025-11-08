@@ -1,19 +1,21 @@
 package controller
 
 import (
-	"fmt"
-	"log"
-	"net"
-	"net/http"
-	"network-panel/golang-backend/internal/app/util"
-	"strings"
-	"time"
+    "fmt"
+    "encoding/json"
+    "log"
+    "net"
+    "net/http"
+    "network-panel/golang-backend/internal/app/util"
+    "strings"
+    "time"
+    "strconv"
 
-	"github.com/gin-gonic/gin"
-	"network-panel/golang-backend/internal/app/dto"
-	"network-panel/golang-backend/internal/app/model"
-	"network-panel/golang-backend/internal/app/response"
-	dbpkg "network-panel/golang-backend/internal/db"
+    "github.com/gin-gonic/gin"
+    "network-panel/golang-backend/internal/app/dto"
+    "network-panel/golang-backend/internal/app/model"
+    "network-panel/golang-backend/internal/app/response"
+    dbpkg "network-panel/golang-backend/internal/db"
 )
 
 // POST /api/v1/forward/create
@@ -39,38 +41,54 @@ func ForwardCreate(c *gin.Context) {
 			return
 		}
 	}
-	// allocate inPort if nil: find first port in range not used
-	inPort := 0
-	if req.InPort != nil {
-		inPort = *req.InPort
-	} else {
-		inPort = firstFreePort(tun.InNodeID, tun, 0)
-	}
-	if inPort == 0 {
-		c.JSON(http.StatusOK, response.ErrMsg("隧道入口端口已满，无法分配新端口"))
-		return
-	}
+    // allocate inPort if nil: find first port in range not used
+    inPort := 0
+    if req.InPort != nil {
+        inPort = *req.InPort
+    } else {
+        inPort = firstFreePort(tun.InNodeID, tun, 0)
+    }
+    // agent-level verification: pick free port on entry node if occupied
+    var inNode model.Node
+    _ = dbpkg.DB.First(&inNode, tun.InNodeID).Error
+    minP := 10000; maxP := 65535
+    if inNode.PortSta > 0 { minP = inNode.PortSta }
+    if inNode.PortEnd > 0 { maxP = inNode.PortEnd }
+    inPort = findFreePortOnNode(tun.InNodeID, inPort, minP, maxP)
+    if inPort == 0 {
+        c.JSON(http.StatusOK, response.ErrMsg("隧道入口端口已满，无法分配新端口"))
+        return
+    }
 	now := time.Now().UnixMilli()
 	f := model.Forward{BaseEntity: model.BaseEntity{CreatedTime: now, UpdatedTime: now}, UserID: uid, Name: req.Name, TunnelID: req.TunnelID, InPort: inPort, RemoteAddr: req.RemoteAddr, InterfaceName: req.InterfaceName, Strategy: req.Strategy}
 	// allocate outPort for legacy tunnel-forward only (no SS params)
-	if tun.Type == 2 {
-		if !(req.SsPort != nil && req.SsPassword != nil && *req.SsPassword != "") {
-			if op := firstFreePortOut(tun, 0); op != 0 {
-				f.OutPort = &op
-			} else {
-				c.JSON(http.StatusOK, response.ErrMsg("隧道出口端口已满，无法分配新端口"))
-				return
-			}
-		}
-	}
+    if tun.Type == 2 {
+        if !(req.SsPort != nil && req.SsPassword != nil && *req.SsPassword != "") {
+            if op := firstFreePortOut(tun, 0); op != 0 {
+                // verify against agent services on exit node
+                exitID := outNodeIDOr0(tun)
+                var outNode model.Node
+                _ = dbpkg.DB.First(&outNode, exitID).Error
+                minO := 10000; maxO := 65535
+                if outNode.PortSta > 0 { minO = outNode.PortSta }
+                if outNode.PortEnd > 0 { maxO = outNode.PortEnd }
+                free := findFreePortOnNode(exitID, op, minO, maxO)
+                if free == 0 { c.JSON(http.StatusOK, response.ErrMsg("隧道出口端口已满，无法分配新端口")); return }
+                f.OutPort = &free
+            } else {
+                c.JSON(http.StatusOK, response.ErrMsg("隧道出口端口已满，无法分配新端口"))
+                return
+            }
+        }
+    }
 	if err := dbpkg.DB.Create(&f).Error; err != nil {
 		c.JSON(http.StatusOK, response.ErrMsg("端口转发创建失败"))
 		return
 	}
-	// push to node(s)
-	name := buildServiceName(f.ID, f.UserID, f.TunnelID)
-	if tun.Type == 2 && f.OutPort != nil {
-		// gRPC HTTP 隧道（出口=relay+grpc，入口=http+chain(dialer=grpc, connector=relay)）
+    // push to node(s)
+    name := buildServiceName(f.ID, f.UserID, f.TunnelID)
+    if tun.Type == 2 && f.OutPort != nil {
+        // gRPC HTTP 隧道（出口=relay+grpc，入口=http+chain(dialer=grpc, connector=relay)）
 		user := fmt.Sprintf("u-%d", f.ID)
 		pass := util.MD5(fmt.Sprintf("%d:%d", f.ID, f.CreatedTime))[:16]
 		outSvc := map[string]any{
@@ -92,31 +110,128 @@ func ForwardCreate(c *gin.Context) {
 		outSvc["_chains"] = []any{map[string]any{"name": "chain_" + name, "metadata": map[string]any{"managedBy": "network-panel"}, "hops": []any{map[string]any{"name": "hop_" + name, "nodes": nodes}}}}
 		_ = sendWSCommand(outNodeIDOr0(tun), "AddService", []map[string]any{outSvc})
 
-		outIP := getOutNodeIP(tun)
-		exitAddr := safeHostPort(outIP, *f.OutPort)
-		inSvc := map[string]any{
-			"name":     name,
-			"addr":     fmt.Sprintf(":%d", f.InPort),
-			"listener": map[string]any{"type": "tcp"},
-			"handler":  map[string]any{"type": "http", "chain": "chain_" + name},
-			"metadata": map[string]any{"managedBy": "network-panel"},
-		}
-		chainName := "chain_" + name
-		hopName := "hop_" + name
-		node := map[string]any{
-			"name":      "node-" + name,
-			"addr":      exitAddr,
-			"connector": map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}},
-			"dialer":    map[string]any{"type": "grpc"},
-		}
-		inSvc["_chains"] = []any{map[string]any{"name": chainName, "metadata": map[string]any{"managedBy": "network-panel"}, "hops": []any{map[string]any{"name": hopName, "nodes": []any{node}}}}}
-		_ = sendWSCommand(tun.InNodeID, "AddService", []map[string]any{inSvc})
-	} else {
-		// port-forward: in-node listens on inPort and forwards to remoteAddr
-		svc := buildServiceConfig(name, f.InPort, f.RemoteAddr, preferIface(f.InterfaceName, tun.InterfaceName))
-		_ = sendWSCommand(tun.InNodeID, "AddService", []map[string]any{svc})
-	}
-	c.JSON(http.StatusOK, response.OkNoData())
+        outIP := getOutNodeIP(tun)
+        exitAddr := safeHostPort(outIP, *f.OutPort)
+
+        // Multi-level path support for tunnel-forward: inNode -> mid(relay grpc) -> ... -> exit(relay grpc)
+        path := getTunnelPathNodes(tun.ID)
+        if len(path) > 0 {
+            // Pre-allocate grpc ports on mids (avoid conflicts using agent query)
+            midPorts := make([]int, len(path))
+            for i := range path {
+                // prefer use inPort as baseline, within node port range if needed
+                var n model.Node
+                _ = dbpkg.DB.First(&n, path[i]).Error
+                minP := 10000; maxP := 65535
+                if n.PortSta > 0 { minP = n.PortSta }
+                if n.PortEnd > 0 { maxP = n.PortEnd }
+                midPorts[i] = findFreePortOnNode(path[i], f.InPort, minP, maxP)
+                if midPorts[i] == 0 { midPorts[i] = f.InPort }
+            }
+            // Deploy relay grpc on each mid, chaining to next hop (relay over grpc)
+            for i := 0; i < len(path); i++ {
+                nid := path[i]
+                thisPort := midPorts[i]
+                nextAddr := ""
+                if i < len(path)-1 {
+                    // next mid relay address
+                var nx model.Node
+                    if err := dbpkg.DB.First(&nx, path[i+1]).Error; err != nil { continue }
+                    nextAddr = safeHostPort(preferIPv4(nx), midPorts[i+1])
+                } else {
+                    // last mid points to exit relay address
+                    nextAddr = exitAddr
+                }
+                // relay server on mid with chain to next relay
+                chainName := fmt.Sprintf("chain_%s_mid_%d", name, i)
+                svc := map[string]any{
+                    "name":     name,
+                    "addr":     fmt.Sprintf(":%d", thisPort),
+                    "listener": map[string]any{"type": "grpc"},
+                    "handler":  map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}, "chain": chainName},
+                    "metadata": map[string]any{"managedBy": "network-panel"},
+                }
+                node := map[string]any{
+                    "name":      fmt.Sprintf("node_mid_%d_%s", i, name),
+                    "addr":      nextAddr,
+                    "connector": map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}},
+                    "dialer":    map[string]any{"type": "grpc"},
+                }
+                svc["_chains"] = []any{map[string]any{"name": chainName, "metadata": map[string]any{"managedBy": "network-panel"}, "hops": []any{map[string]any{"name": chainName + "_hop", "nodes": []any{node}}}}}
+                _ = sendWSCommand(nid, "AddService", []map[string]any{svc})
+            }
+            // In node: chain to first mid relay
+            var first model.Node
+            if err := dbpkg.DB.First(&first, path[0]).Error; err == nil {
+                inSvc := map[string]any{
+                    "name":     name,
+                    "addr":     fmt.Sprintf(":%d", f.InPort),
+                    "listener": map[string]any{"type": "tcp"},
+                    "handler":  map[string]any{"type": "http", "chain": "chain_" + name},
+                    "metadata": map[string]any{"managedBy": "network-panel"},
+                }
+                chainName := "chain_" + name
+                hopName := "hop_" + name
+                node := map[string]any{
+                    "name":      "node-" + name,
+                    "addr":      safeHostPort(preferIPv4(first), midPorts[0]),
+                    "connector": map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}},
+                    "dialer":    map[string]any{"type": "grpc"},
+                }
+                inSvc["_chains"] = []any{map[string]any{"name": chainName, "metadata": map[string]any{"managedBy": "network-panel"}, "hops": []any{map[string]any{"name": hopName, "nodes": []any{node}}}}}
+                _ = sendWSCommand(tun.InNodeID, "AddService", []map[string]any{inSvc})
+            }
+        } else {
+            // Original single-hop: in -> exit relay
+            inSvc := map[string]any{
+                "name":     name,
+                "addr":     fmt.Sprintf(":%d", f.InPort),
+                "listener": map[string]any{"type": "tcp"},
+                "handler":  map[string]any{"type": "http", "chain": "chain_" + name},
+                "metadata": map[string]any{"managedBy": "network-panel"},
+            }
+            chainName := "chain_" + name
+            hopName := "hop_" + name
+            node := map[string]any{
+                "name":      "node-" + name,
+                "addr":      exitAddr,
+                "connector": map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}},
+                "dialer":    map[string]any{"type": "grpc"},
+            }
+            inSvc["_chains"] = []any{map[string]any{"name": chainName, "metadata": map[string]any{"managedBy": "network-panel"}, "hops": []any{map[string]any{"name": hopName, "nodes": []any{node}}}}}
+            _ = sendWSCommand(tun.InNodeID, "AddService", []map[string]any{inSvc})
+        }
+    } else {
+        // port-forward: support multi-level path
+        path := getTunnelPathNodes(tun.ID)
+        if len(path) == 0 {
+            // single hop: in-node listens on inPort and forwards to remoteAddr
+            svc := buildServiceConfig(name, f.InPort, f.RemoteAddr, preferIface(f.InterfaceName, tun.InterfaceName))
+            _ = sendWSCommand(tun.InNodeID, "AddService", []map[string]any{svc})
+        } else {
+            // chain: [inNode -> mid1 -> mid2 -> ... -> last], each listens on same inPort and forwards to next hop (last forwards to final remote)
+            hops := append([]int64{tun.InNodeID}, path...)
+            for i := 0; i < len(hops); i++ {
+                nodeID := hops[i]
+                var target string
+                if i < len(hops)-1 {
+                    // next hop server IP: use Node.server_ip
+                    var n model.Node
+                    if err := dbpkg.DB.First(&n, hops[i+1]).Error; err == nil {
+                        target = safeHostPort(n.ServerIP, f.InPort)
+                    } else {
+                        continue
+                    }
+                } else {
+                    // last hop forwards to final remote
+                    target = f.RemoteAddr
+                }
+                svc := buildServiceConfig(name, f.InPort, target, preferIface(f.InterfaceName, tun.InterfaceName))
+                _ = sendWSCommand(nodeID, "AddService", []map[string]any{svc})
+            }
+        }
+    }
+    c.JSON(http.StatusOK, response.OkNoData())
 }
 
 // POST /api/v1/forward/list
@@ -490,7 +605,7 @@ func ForwardDiagnose(c *gin.Context) {
 	c.JSON(http.StatusOK, response.Ok(out))
 }
 
-// POST /api/v1/forward/diagnose-step {forwardId, step: entryExit|nodeRemote|iperf3}
+// POST /api/v1/forward/diagnose-step {forwardId, step: entryExit|nodeRemote|iperf3|path}
 func ForwardDiagnoseStep(c *gin.Context) {
 	var p struct {
 		ForwardID int64  `json:"forwardId" binding:"required"`
@@ -513,40 +628,90 @@ func ForwardDiagnoseStep(c *gin.Context) {
 		_ = dbpkg.DB.First(&outNode, *t.OutNodeID).Error
 	}
 
-	log.Printf("API /forward/diagnose-step forwardId=%d step=%s inNode=%d outNode=%d tunnelType=%d", p.ForwardID, p.Step, t.InNodeID, ifThen(t.OutNodeID != nil, *t.OutNodeID, int64(0)), t.Type)
-	var res map[string]interface{}
-	switch p.Step {
-	case "entryExit":
-		if t.Type != 2 || f.OutPort == nil {
-			c.JSON(http.StatusOK, response.ErrMsg("非隧道转发或未分配出口端口"))
-			return
-		}
-		exitIP := orString(ptrString(t.OutIP), outNode.ServerIP)
-		avg, loss, ok, msg, rid := diagnoseFromNodeCtx(inNode.ID, exitIP, *f.OutPort, 3, 1500, map[string]interface{}{"src": "forward", "step": "entryExit", "forwardId": f.ID})
-		res = map[string]interface{}{
-			"success": ok, "description": "入口到出口连通性", "nodeName": inNode.Name, "nodeId": inNode.ID,
-			"targetIp": exitIP, "targetPort": *f.OutPort, "averageTime": avg, "packetLoss": loss, "message": msg, "reqId": rid,
-		}
-	case "nodeRemote":
-		// 在隧道转发时从出口节点访问远端，否则从入口节点
-		runNode := inNode
-		runNodeID := inNode.ID
-		if t.Type == 2 {
-			runNode = outNode
-			runNodeID = outNode.ID
-		}
-		hp := firstTargetHost(f.RemoteAddr)
-		host, port := splitHostPortSafe(hp)
-		avg, loss, ok, msg, rid := diagnoseFromNodeCtx(runNodeID, host, port, 3, 1500, map[string]interface{}{"src": "forward", "step": "nodeRemote", "forwardId": f.ID})
-		res = map[string]interface{}{
-			"success": ok, "description": ifThen(t.Type == 2, "出口节点到远端连通性", "入口节点到远端连通性"),
-			"nodeName": runNode.Name, "nodeId": runNodeID, "targetIp": host, "targetPort": port, "averageTime": avg, "packetLoss": loss, "message": msg, "reqId": rid,
-		}
-	case "iperf3":
-		if t.Type != 2 {
-			c.JSON(http.StatusOK, response.ErrMsg("仅隧道转发支持iperf3"))
-			return
-		}
+    outId := int64(0)
+    if t.OutNodeID != nil { outId = *t.OutNodeID }
+    log.Printf("API /forward/diagnose-step forwardId=%d step=%s inNode=%d outNode=%d tunnelType=%d", p.ForwardID, p.Step, t.InNodeID, outId, t.Type)
+    var res map[string]interface{}
+    switch p.Step {
+    case "entryExit":
+        if t.Type == 2 {
+            // 隧道转发：入口到出口
+            if f.OutPort == nil || outNode.ID == 0 {
+                c.JSON(http.StatusOK, response.ErrMsg("未分配出口端口或无出口节点"))
+                return
+            }
+            exitIP := orString(ptrString(t.OutIP), outNode.ServerIP)
+            avg, loss, ok, msg, rid := diagnoseFromNodeCtx(inNode.ID, exitIP, *f.OutPort, 3, 1500, map[string]interface{}{"src": "forward", "step": "entryExit", "forwardId": f.ID})
+            res = map[string]interface{}{
+                "success": ok, "description": "入口到出口连通性", "nodeName": inNode.Name, "nodeId": inNode.ID,
+                "targetIp": exitIP, "targetPort": *f.OutPort, "averageTime": avg, "packetLoss": loss, "message": msg, "reqId": rid,
+            }
+        } else {
+            // 端口转发：无出口节点，直接验证入口节点到远端
+            hp := firstTargetHost(f.RemoteAddr)
+            host, port := splitHostPortSafe(hp)
+            avg, loss, ok, msg, rid := diagnoseFromNodeCtx(inNode.ID, host, port, 3, 1500, map[string]interface{}{"src": "forward", "step": "entryRemote", "forwardId": f.ID})
+            res = map[string]interface{}{
+                "success": ok, "description": "入口节点到远端连通性", "nodeName": inNode.Name, "nodeId": inNode.ID,
+                "targetIp": host, "targetPort": port, "averageTime": avg, "packetLoss": loss, "message": msg, "reqId": rid,
+            }
+        }
+    case "nodeRemote":
+        // 在隧道转发时从出口节点访问远端，否则从入口节点
+        runNode := inNode
+        runNodeID := inNode.ID
+        if t.Type == 2 {
+            runNode = outNode
+            runNodeID = outNode.ID
+        }
+        hp := firstTargetHost(f.RemoteAddr)
+        host, port := splitHostPortSafe(hp)
+        avg, loss, ok, msg, rid := diagnoseFromNodeCtx(runNodeID, host, port, 3, 1500, map[string]interface{}{"src": "forward", "step": "nodeRemote", "forwardId": f.ID})
+        res = map[string]interface{}{
+            "success": ok, "description": ifThen(t.Type == 2, "出口节点到远端连通性", "入口节点到远端连通性"),
+            "nodeName": runNode.Name, "nodeId": runNodeID, "targetIp": host, "targetPort": port, "averageTime": avg, "packetLoss": loss, "message": msg, "reqId": rid,
+        }
+    case "path":
+        // 逐跳检查：端口转发型（type=1）：入口->中间节点(ICMP)，最后一跳到远端(TCP)
+        //          隧道转发型（type=2）：入口->中间->出口(ICMP)，最后出口->远端(TCP)
+        path := getTunnelPathNodes(t.ID)
+        hops := make([]int64, 0, 2+len(path))
+        hops = append(hops, t.InNodeID)
+        hops = append(hops, path...)
+        if t.Type == 2 && t.OutNodeID != nil { hops = append(hops, *t.OutNodeID) }
+        items := make([]map[string]any, 0)
+        // ICMP for node-to-node hops
+        for i := 0; i+1 < len(hops); i++ {
+            var srcN, dstN model.Node
+            _ = dbpkg.DB.First(&srcN, hops[i]).Error
+            _ = dbpkg.DB.First(&dstN, hops[i+1]).Error
+            target := dstN.ServerIP
+            avg, loss, ok, msg, rid := diagnosePingFromNodeCtx(srcN.ID, target, 3, 1500, map[string]interface{}{"src": "forward", "step": "path", "forwardId": f.ID, "hopIndex": i})
+            items = append(items, map[string]any{
+                "success": ok, "description": "逐跳连通性 (ICMP)", "nodeName": srcN.Name, "nodeId": srcN.ID,
+                "targetIp": target, "averageTime": avg, "packetLoss": loss, "message": msg, "reqId": rid,
+            })
+        }
+        // final: last hop node to remote host:port via TCP
+        hp := firstTargetHost(f.RemoteAddr)
+        host, port := splitHostPortSafe(hp)
+        if len(hops) > 0 && host != "" && port > 0 {
+            last := hops[len(hops)-1]
+            var lastN model.Node
+            _ = dbpkg.DB.First(&lastN, last).Error
+            avg, loss, ok, msg, rid := diagnoseFromNodeCtx(last, host, port, 3, 1500, map[string]interface{}{"src": "forward", "step": "remote", "forwardId": f.ID})
+            items = append(items, map[string]any{
+                "success": ok, "description": "最终到远端连通性 (TCP)", "nodeName": lastN.Name, "nodeId": last,
+                "targetIp": host, "targetPort": port, "averageTime": avg, "packetLoss": loss, "message": msg, "reqId": rid,
+            })
+        }
+        c.JSON(http.StatusOK, response.Ok(map[string]any{"results": items}))
+        return
+    case "iperf3":
+        if t.Type != 2 {
+            c.JSON(http.StatusOK, response.ErrMsg("仅隧道转发支持iperf3"))
+            return
+        }
 		exitIP := orString(ptrString(t.OutIP), outNode.ServerIP)
 		// 1) 让出口节点随机端口启动服务器
 		srvReq := map[string]interface{}{"requestId": RandUUID(), "mode": "iperf3", "server": true, "port": 0}
@@ -617,6 +782,27 @@ func firstTargetHost(addr string) string {
 	// strip brackets for IPv6 if present; keep host
 	// host:port format assumed
 	return addr
+}
+
+// getTunnelPathNodes reads optional multi-level path from ViteConfig (name: tunnel_path_<id>), JSON array of node IDs
+func getTunnelPathNodes(tunnelID int64) []int64 {
+    var cfg model.ViteConfig
+    key := fmt.Sprintf("tunnel_path_%d", tunnelID)
+    if err := dbpkg.DB.Where("name = ?", key).First(&cfg).Error; err != nil || cfg.Value == "" {
+        return nil
+    }
+    var ids []int64
+    if e := json.Unmarshal([]byte(cfg.Value), &ids); e == nil {
+        return ids
+    }
+    // also support comma separated values
+    parts := strings.Split(cfg.Value, ",")
+    for _, p := range parts {
+        p = strings.TrimSpace(p)
+        if p == "" { continue }
+        if v, err := strconv.ParseInt(p, 10, 64); err == nil { ids = append(ids, v) }
+    }
+    return ids
 }
 
 func splitHostPortSafe(hp string) (string, int) {
@@ -716,6 +902,79 @@ func buildServiceConfig(name string, listenPort int, target string, iface *strin
 	}
 	svc["metadata"] = meta
 	return svc
+}
+
+// ---- Helpers for multi-level tunnel: query in-use ports and pick free port ----
+
+func queryNodeServicePorts(nodeID int64) map[int]bool {
+    ports := map[int]bool{}
+    reqID := RandUUID()
+    payload := map[string]any{"requestId": reqID}
+    if err := sendWSCommand(nodeID, "QueryServices", payload); err != nil {
+        return ports
+    }
+    ch := make(chan map[string]interface{}, 1)
+    diagMu.Lock(); diagWaiters[reqID] = ch; diagMu.Unlock()
+    select {
+    case res := <-ch:
+        if data, ok := res["data"].([]interface{}); ok {
+            for _, it := range data {
+                m, _ := it.(map[string]interface{})
+                if m == nil { continue }
+                if v, ok2 := m["addr"].(string); ok2 {
+                    if p := parsePort(v); p > 0 { ports[p] = true; continue }
+                }
+                if lst, ok2 := m["listener"].(map[string]interface{}); ok2 {
+                    if v, ok3 := lst["addr"].(string); ok3 {
+                        if p := parsePort(v); p > 0 { ports[p] = true }
+                    }
+                }
+            }
+        }
+    case <-time.After(3 * time.Second):
+        diagMu.Lock(); delete(diagWaiters, reqID); diagMu.Unlock()
+    }
+    return ports
+}
+
+func parsePort(addr string) int {
+    host, port, err := net.SplitHostPort(addr)
+    _ = host
+    if err != nil { return 0 }
+    v, _ := net.LookupPort("tcp", port)
+    return v
+}
+
+// query raw services list for a node via WS (best-effort)
+func queryNodeServicesRaw(nodeID int64) []map[string]any {
+    reqID := RandUUID()
+    payload := map[string]any{"requestId": reqID}
+    if err := sendWSCommand(nodeID, "QueryServices", payload); err != nil {
+        return nil
+    }
+    ch := make(chan map[string]interface{}, 1)
+    diagMu.Lock(); diagWaiters[reqID] = ch; diagMu.Unlock()
+    defer func(){ diagMu.Lock(); delete(diagWaiters, reqID); diagMu.Unlock() }()
+    select {
+    case res := <-ch:
+        if data, ok := res["data"].([]interface{}); ok {
+            out := make([]map[string]any, 0, len(data))
+            for _, it := range data { if m, ok2 := it.(map[string]any); ok2 { out = append(out, m) } }
+            return out
+        }
+    case <-time.After(3 * time.Second):
+    }
+    return nil
+}
+
+func findFreePortOnNode(nodeID int64, prefer int, min int, max int) int {
+    used := queryNodeServicePorts(nodeID)
+    start := prefer
+    if start <= 0 { start = min }
+    if start >= min && start <= max && !used[start] { return start }
+    for p := start + 1; p <= max; p++ { if !used[p] { return p } }
+    for p := start - 1; p >= min; p-- { if !used[p] { return p } }
+    return 0
 }
 
 // build shadowsocks server service on exit node

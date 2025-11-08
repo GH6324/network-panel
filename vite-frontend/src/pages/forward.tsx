@@ -683,23 +683,23 @@ export default function ForwardPage() {
     setDiagnosisLoading(true);
     setDiagnosisResult(null);
 
-    // 流式增量：依次入口->出口、节点->远端、iperf3
+    // 流式增量：优先逐跳路径，再到远端（与隧道诊断保持一致）
     setDiagnosisResult({ forwardName: forward.name, timestamp: Date.now(), results: [] });
     const append = (item: any) => {
       setDiagnosisResult(prev => prev ? ({ ...prev, results: [...prev.results, item] }) : prev);
     };
     try {
-      // 1) 入口到出口（仅隧道转发）
-      if (forward.tunnelName && forward.tunnelId) {
-        const r1 = await diagnoseForwardStep(forward.id, 'entryExit');
-        if (r1.code === 0) append(r1.data); else append({ success: false, description: '入口到出口连通性', nodeName: '-', nodeId: '-', targetIp: '-', message: r1.msg || '失败' });
+      // 1) 逐跳路径（端口转发：入口->中间，最后到远端；隧道转发：入口->中间->出口，最后出口->远端）
+      const rPath = await diagnoseForwardStep(forward.id, 'path');
+      if (rPath.code === 0) {
+        const arr = Array.isArray(rPath.data?.results) ? rPath.data.results : (rPath.data ? [rPath.data] : []);
+        arr.forEach((it:any) => append(it));
+      } else {
+        append({ success: false, description: '路径连通性', nodeName: '-', nodeId: '-', targetIp: '-', message: rPath.msg || '失败' });
       }
-      // 2) 节点到远端（tcp）
-      const r2 = await diagnoseForwardStep(forward.id, 'nodeRemote');
-      if (r2.code === 0) append(r2.data); else append({ success: false, description: '节点到远端连通性', nodeName: '-', nodeId: '-', targetIp: '-', message: r2.msg || '失败' });
       // 3) iperf3 反向带宽（仅隧道转发）
-      const r3 = await diagnoseForwardStep(forward.id, 'iperf3');
-      if (r3.code === 0) append(r3.data); else append({ success: false, description: 'iperf3 反向带宽测试', nodeName: '-', nodeId: '-', targetIp: '-', message: r3.msg || '未支持或失败' });
+      //const r3 = await diagnoseForwardStep(forward.id, 'iperf3');
+     // if (r3.code === 0) append(r3.data); else append({ success: false, description: 'iperf3 反向带宽测试', nodeName: '-', nodeId: '-', targetIp: '-', message: r3.msg || '未支持或失败' });
     } catch (e) {
       toast.error('诊断失败');
     } finally {

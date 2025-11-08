@@ -97,6 +97,9 @@ export default function TunnelPage() {
   const [tunnelToDelete, setTunnelToDelete] = useState<Tunnel | null>(null);
   const [currentDiagnosisTunnel, setCurrentDiagnosisTunnel] = useState<Tunnel | null>(null);
   const [diagnosisResult, setDiagnosisResult] = useState<DiagnosisResult | null>(null);
+  // 多级路径（中间节点按顺序）
+  const [midPath, setMidPath] = useState<number[]>([]);
+  const [addMidNodeId, setAddMidNodeId] = useState<number | ''>('');
   
   // 表单状态
   const [form, setForm] = useState<TunnelForm>({
@@ -217,6 +220,8 @@ export default function TunnelPage() {
       status: 1
     });
     setErrors({});
+    setMidPath([]);
+    setAddMidNodeId('');
     setExitPort(null); setExitPassword(""); setExitMethod("AEAD_CHACHA20_POLY1305"); setExitObserver("console"); setExitLimiter(""); setExitRLimiter(""); setExitDeployed(""); setExitMetaItems([]);
     setModalOpen(true);
   };
@@ -239,6 +244,10 @@ export default function TunnelPage() {
       status: tunnel.status
     });
     setErrors({});
+    setMidPath([]);
+    setAddMidNodeId('');
+    // 拉取路径
+    (async ()=>{ try { const { getTunnelPath } = await import('@/api'); const r:any = await getTunnelPath(tunnel.id); if (r.code===0 && Array.isArray(r.data?.path)) setMidPath(r.data.path); } catch {} })();
     setExitPort(null); setExitPassword(""); setExitMethod("AEAD_CHACHA20_POLY1305"); setExitObserver("console"); setExitLimiter(""); setExitRLimiter(""); setExitDeployed(""); setExitMetaItems([]);
     setModalOpen(true);
   };
@@ -295,6 +304,21 @@ export default function TunnelPage() {
         : await createTunnel(data);
         
       if (response.code === 0) {
+        // 保存多级路径
+        try {
+          const { setTunnelPath, getTunnelList } = await import('@/api');
+          if (isEdit && form.id && midPath.length>0) {
+            await setTunnelPath(form.id, midPath);
+          } else if (!isEdit && midPath.length>0) {
+            // 创建后尝试解析新隧道ID：按名称与入口节点匹配，取ID最大的一条
+            const lr:any = await getTunnelList();
+            if (lr && lr.code===0 && Array.isArray(lr.data)) {
+              const candidates = (lr.data as any[]).filter(x=>x.name===form.name && x.inNodeId===form.inNodeId);
+              const tid = candidates.length>0 ? candidates.sort((a,b)=> (b.id||0)-(a.id||0))[0].id : undefined;
+              if (tid) { await setTunnelPath(tid, midPath); }
+            }
+          }
+        } catch {}
         toast.success(isEdit ? '更新成功' : '创建成功');
         // 入口/出口服务由转发创建时一并配置（forward.create/update 负责下发），此处不再直接创建SS
         setModalOpen(false);
@@ -337,10 +361,15 @@ export default function TunnelPage() {
         if (r1.code === 0) append(r1.data); else append({ success: false, description: '入口外网连通性 (ICMP 1.1.1.1)', nodeName: '-', nodeId: '-', targetIp: '1.1.1.1', message: r1.msg || '失败' });
       }
 
-      // 1) 入口到出口（ICMP）仅隧道转发
+      // 1) 逐跳ICMP（仅隧道转发）
       if (tunnel.type === 2) {
-        const r2 = await diagnoseTunnelStep(tunnel.id, 'entryExit');
-        if (r2.code === 0) append(r2.data); else append({ success: false, description: '入口到出口连通性', nodeName: '-', nodeId: '-', targetIp: '-', message: r2.msg || '失败' });
+        const rp = await diagnoseTunnelStep(tunnel.id, 'path');
+        if (rp.code === 0) {
+          if (rp.data && Array.isArray(rp.data.results)) rp.data.results.forEach((it:any)=>append(it));
+          else append({ success: false, description: '路径连通性(逐跳)', nodeName: '-', nodeId: '-', targetIp: '-', message: '无数据' });
+        } else {
+          append({ success: false, description: '路径连通性(逐跳)', nodeName: '-', nodeId: '-', targetIp: '-', message: rp.msg || '失败' });
+        }
       }
 
       // 2) 出口到 1.1.1.1（ICMP）仅隧道转发
@@ -579,6 +608,29 @@ export default function TunnelPage() {
                       >
                         诊断
                       </Button>
+                      {tunnel.type===2 && (
+                        <Button size="sm" variant="flat" color="secondary" className="flex-1 min-h-8" onPress={async()=>{
+                          try { const { checkTunnelPath } = await import('@/api'); const r:any = await checkTunnelPath(tunnel.id); if (r.code===0){
+                            const bad = (r.data?.hops||[]).filter((h:any)=>!h.online || (h.role==='mid' && !h.proposedPort)).length; 
+                            toast.success(`路径检查完成：${(r.data?.hops||[]).length} 跳，异常 ${bad} 处`);
+                            setDiagnosisResult({ tunnelName: tunnel.name, tunnelType: '隧道转发', timestamp: Date.now(), results: (r.data?.hops||[]).map((h:any)=>({
+                              success: h.online && (h.role!=='mid' || !!h.proposedPort),
+                              description: `节点(${h.role}) ${h.nodeName}`,
+                              nodeName: h.nodeName,
+                              nodeId: String(h.nodeId),
+                              targetIp: '-',
+                              message: `${h.online? '在线':'离线'}${h.relayGrpc? ' · 有relay(grpc)':''}${h.proposedPort? ` · 建议端口 ${h.proposedPort}`: ''}`
+                            }))});
+                            setCurrentDiagnosisTunnel(tunnel); setDiagnosisModalOpen(true); setDiagnosisLoading(false);
+                          } else { toast.error(r.msg||'检查失败'); }
+                          } catch { toast.error('检查失败'); }
+                        }}>检查路径</Button>
+                      )}
+                      {tunnel.type===2 && (
+                        <Button size="sm" variant="flat" color="danger" className="flex-1 min-h-8" onPress={async()=>{
+                          try { const { cleanupTunnelTemp } = await import('@/api'); const r:any = await cleanupTunnelTemp(tunnel.id); if (r.code===0){ toast.success(`已清理临时通道：${r.data?.deleted||0}/${r.data?.found||0}`); } else { toast.error(r.msg||'清理失败'); } } catch { toast.error('清理失败'); }
+                        }}>清理临时通道</Button>
+                      )}
                       <Button
                         size="sm"
                         variant="flat"
@@ -825,6 +877,53 @@ export default function TunnelPage() {
                         }
                       />
                     </div>
+
+                    {/* 多级路径（中间节点，按顺序，仅隧道转发） */}
+                    {form.type === 2 && (
+                      <div className="mt-2">
+                        <h3 className="text-base font-semibold mb-1">多级路径</h3>
+                        <div className="flex items-center gap-2 mb-2">
+                          <Select
+                            label="添加中间节点"
+                            selectedKeys={addMidNodeId? [String(addMidNodeId)]: []}
+                            onSelectionChange={(keys)=>{
+                              const k = Array.from(keys)[0] as string; if (!k) return; const v = parseInt(k); setAddMidNodeId(isNaN(v)? '' : v);
+                            }}
+                            className="max-w-[260px]"
+                            size="sm"
+                          >
+                            {nodes.filter(n => n.id !== form.inNodeId && n.id !== (form.outNodeId||0) && !midPath.includes(n.id)).map(n => (
+                              <SelectItem key={String(n.id)}>{n.name}</SelectItem>
+                            ))}
+                          </Select>
+                          <Button size="sm" variant="flat" onPress={()=>{ if(addMidNodeId){ const nid=Number(addMidNodeId); if(!midPath.includes(nid)) setMidPath(prev=>[...prev, nid]); setAddMidNodeId(''); } }}>添加</Button>
+                        </div>
+                        {midPath.length===0 ? (
+                          <div className="text-xs text-default-500">未配置中间节点</div>
+                        ) : (
+                          <div className="space-y-2">
+                            {midPath.map((nid, idx)=>{
+                              const n = nodes.find(x=>x.id===nid);
+                              return (
+                                <div key={nid} className="flex items-center gap-2 text-sm">
+                                  <div className="flex-1">{idx+1}. {n?.name || `节点${nid}`}</div>
+                                  <div className="flex items-center gap-1">
+                                    <Button size="sm" variant="flat" onPress={()=>{
+                                      setMidPath(prev=>{ const i=prev.indexOf(nid); if(i<=0) return prev.slice(); const arr=prev.slice(); const t=arr[i-1]; arr[i-1]=arr[i]; arr[i]=t; return arr; });
+                                    }}>上移</Button>
+                                    <Button size="sm" variant="flat" onPress={()=>{
+                                      setMidPath(prev=>{ const i=prev.indexOf(nid); if(i<0||i>=prev.length-1) return prev.slice(); const arr=prev.slice(); const t=arr[i+1]; arr[i+1]=arr[i]; arr[i]=t; return arr; });
+                                    }}>下移</Button>
+                                    <Button size="sm" color="danger" variant="flat" onPress={()=> setMidPath(prev=>prev.filter(id=>id!==nid))}>移除</Button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                        <div className="text-2xs text-default-400 mt-1">说明：仅对“隧道转发”生效。入口→中间节点→出口（gRPC）依次直转。</div>
+                      </div>
+                    )}
 
                     {/* 隧道转发时显示出口网卡配置 */}
                     {form.type === 2 && (

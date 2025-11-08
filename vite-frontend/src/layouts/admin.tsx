@@ -58,36 +58,6 @@ export default function AdminLayout({
       )
     },
     {
-      path: '/migrate',
-      label: '数据迁移',
-      icon: (
-        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-          <path d="M4 3h12v4H4V3zm0 6h12v8H4V9zm2 2v4h8v-4H6z" />
-        </svg>
-      ),
-      adminOnly: true
-    },
-    {
-      path: '/probe',
-      label: '探针目标',
-      icon: (
-        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-          <path d="M2 11a1 1 0 011-1h2.586l2-2H8a1 1 0 110-2h1.586l2-2H14a1 1 0 110 2h-.586l-2 2H12a1 1 0 110 2h-.586l-2 2H11a1 1 0 110 2H7a1 1 0 01-1-1v-.586l-2 2V17a1 1 0 11-2 0v-4z" />
-        </svg>
-      ),
-      adminOnly: true
-    },
-    {
-      path: '/network',
-      label: '网络',
-      icon: (
-        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-          <path d="M4 13l3-3 2 2 5-5 2 2v4H4z" />
-        </svg>
-      ),
-      adminOnly: true
-    },
-    {
       path: '/forward',
       label: '转发管理',
       icon: (
@@ -116,6 +86,36 @@ export default function AdminLayout({
       ),
       adminOnly: true
     },
+         {
+           path: '/migrate',
+           label: '数据迁移',
+           icon: (
+             <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+               <path d="M4 3h12v4H4V3zm0 6h12v8H4V9zm2 2v4h8v-4H6z" />
+             </svg>
+           ),
+           adminOnly: true
+         },
+         {
+           path: '/probe',
+           label: '探针目标',
+           icon: (
+             <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+               <path d="M2 11a1 1 0 011-1h2.586l2-2H8a1 1 0 110-2h1.586l2-2H14a1 1 0 110 2h-.586l-2 2H12a1 1 0 110 2h-.586l-2 2H11a1 1 0 110 2H7a1 1 0 01-1-1v-.586l-2 2V17a1 1 0 11-2 0v-4z" />
+             </svg>
+           ),
+           adminOnly: true
+         },
+         {
+           path: '/network',
+           label: '网络',
+           icon: (
+             <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+               <path d="M4 13l3-3 2 2 5-5 2 2v4H4z" />
+             </svg>
+           ),
+           adminOnly: true
+         },
     {
       path: '/limit',
       label: '限速管理',
@@ -301,7 +301,6 @@ export default function AdminLayout({
              <Logo size={24} />
              <div className="flex-1 min-w-0">
                <h1 className="text-sm font-bold text-foreground overflow-hidden whitespace-nowrap">{siteConfig.name}</h1>
-               <p className="text-xs text-default-500">v{siteConfig.version}</p>
              </div>
            </div>
          </div>
@@ -341,7 +340,7 @@ export default function AdminLayout({
             <p className="text-xs text-gray-400 dark:text-gray-500">
               Powered by{' '}
               <a 
-                href="https://github.com/bqlpfy/network-panel" 
+                href="https://github.com/NiuStar/network-panel" 
                 target="_blank" 
                 rel="noopener noreferrer"
                 className="text-gray-500 dark:text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
