@@ -110,6 +110,10 @@ func RegisterRoutes(r *gin.Engine) {
 			adm.POST("/diagnose", controller.TunnelDiagnose)
 			adm.POST("/diagnose-step", controller.TunnelDiagnoseStep)
 			adm.POST("/path-check", controller.TunnelPathCheck)
+			adm.POST("/iface/get", controller.TunnelIfaceGet)
+			adm.POST("/iface/set", controller.TunnelIfaceSet)
+			adm.POST("/bind/get", controller.TunnelBindGet)
+			adm.POST("/bind/set", controller.TunnelBindSet)
 			adm.POST("/cleanup-temp", controller.TunnelCleanupTemp)
 		}
 	}

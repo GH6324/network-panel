@@ -53,6 +53,12 @@ export const getTunnelPath = (tunnelId: number) => Network.post("/tunnel/path/ge
 export const setTunnelPath = (tunnelId: number, path: number[]) => Network.post("/tunnel/path/set", { tunnelId, path });
 export const checkTunnelPath = (tunnelId: number) => Network.post("/tunnel/path-check", { tunnelId });
 export const cleanupTunnelTemp = (tunnelId: number) => Network.post("/tunnel/cleanup-temp", { tunnelId });
+// 隧道每个节点出口IP（interface）设置
+export const getTunnelIface = (tunnelId: number) => Network.post("/tunnel/iface/get", { tunnelId });
+export const setTunnelIface = (tunnelId: number, ifaces: Array<{nodeId:number, ip:string}>) => Network.post("/tunnel/iface/set", { tunnelId, ifaces });
+// 隧道每个节点入站绑定IP（listener 绑定 IP）
+export const getTunnelBind = (tunnelId: number) => Network.post("/tunnel/bind/get", { tunnelId });
+export const setTunnelBind = (tunnelId: number, binds: Array<{nodeId:number, ip:string}>) => Network.post("/tunnel/bind/set", { tunnelId, binds });
 
 // 用户隧道权限管理操作 - 全部使用POST请求
 export const assignUserTunnel = (data: any) => Network.post("/tunnel/user/assign", data);

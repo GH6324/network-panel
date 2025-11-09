@@ -48,12 +48,14 @@ func ForwardCreate(c *gin.Context) {
     } else {
         inPort = firstFreePort(tun.InNodeID, tun, 0)
     }
-    // agent-level verification: pick free port on entry node if occupied
+    // agent-level verification and range enforcement on entry node
     var inNode model.Node
     _ = dbpkg.DB.First(&inNode, tun.InNodeID).Error
     minP := 10000; maxP := 65535
     if inNode.PortSta > 0 { minP = inNode.PortSta }
     if inNode.PortEnd > 0 { maxP = inNode.PortEnd }
+    // if provided port not in range, ignore it and pick a free one in range
+    if inPort < minP || inPort > maxP { inPort = 0 }
     inPort = findFreePortOnNode(tun.InNodeID, inPort, minP, maxP)
     if inPort == 0 {
         c.JSON(http.StatusOK, response.ErrMsg("隧道入口端口已满，无法分配新端口"))
@@ -91,14 +93,14 @@ func ForwardCreate(c *gin.Context) {
         // gRPC HTTP 隧道（出口=relay+grpc，入口=http+chain(dialer=grpc, connector=relay)）
 		user := fmt.Sprintf("u-%d", f.ID)
 		pass := util.MD5(fmt.Sprintf("%d:%d", f.ID, f.CreatedTime))[:16]
-		outSvc := map[string]any{
-			"name":     name,
-			"addr":     fmt.Sprintf(":%d", *f.OutPort),
-			"listener": map[string]any{"type": "grpc"},
-			// 出口不再配置 chain，仅作为 relay 服务端
-			"handler":  map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}},
-			"metadata": map[string]any{"managedBy": "network-panel"},
-		}
+        outSvc := map[string]any{
+            "name":     name,
+            "addr":     fmt.Sprintf(":%d", *f.OutPort),
+            "listener": map[string]any{"type": "grpc"},
+            // 出口不再配置 chain，仅作为 relay 服务端
+            "handler":  map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}},
+            "metadata": map[string]any{"managedBy": "network-panel", "managedby": "network-panel"},
+        }
 		_ = sendWSCommand(outNodeIDOr0(tun), "AddService", []map[string]any{outSvc})
 
         outIP := getOutNodeIP(tun)
@@ -110,7 +112,7 @@ func ForwardCreate(c *gin.Context) {
         // - entry: HTTP handler with chain(connector=relay, dialer=grpc) targeting FIRST MID addr:port
         path := getTunnelPathNodes(tun.ID)
         if len(path) > 0 {
-            // Pre-allocate TCP ports on mids (avoid conflicts using agent query)
+            // Pre-allocate TCP ports on mids (avoid conflicts using agent query), enforce each node's port range
             midPorts := make([]int, len(path))
             for i := range path {
                 // prefer use inPort as baseline, within node port range if needed
@@ -119,9 +121,13 @@ func ForwardCreate(c *gin.Context) {
                 minP := 10000; maxP := 65535
                 if n.PortSta > 0 { minP = n.PortSta }
                 if n.PortEnd > 0 { maxP = n.PortEnd }
-                midPorts[i] = findFreePortOnNode(path[i], f.InPort, minP, maxP)
+                prefer := f.InPort
+                if prefer < minP || prefer > maxP { prefer = 0 }
+                midPorts[i] = findFreePortOnNode(path[i], prefer, minP, maxP)
                 if midPorts[i] == 0 { midPorts[i] = f.InPort }
             }
+            // Read per-node interface mapping
+            ifaceMap := getTunnelIfaceMap(tun.ID)
             // Deploy simple TCP forward on each mid to the next hop
             for i := 0; i < len(path); i++ {
                 nid := path[i]
@@ -136,7 +142,23 @@ func ForwardCreate(c *gin.Context) {
                     target = exitAddr
                 }
                 midName := fmt.Sprintf("%s_mid_%d", name, i)
-                svc := buildServiceConfig(midName, thisPort, target, nil)
+                var iface *string
+                if ip, ok := ifaceMap[nid]; ok && ip != "" { tmp := ip; iface = &tmp }
+                // bind IP (in IP) for mids and exit (nid != entry)
+                bindMap := getTunnelBindMap(tun.ID)
+                addrStr := fmt.Sprintf(":%d", thisPort)
+                if bindIP, ok := bindMap[nid]; ok && bindIP != "" {
+                    addrStr = safeHostPort(bindIP, thisPort)
+                }
+                svc := map[string]any{
+                    "name": midName,
+                    "addr": addrStr,
+                    "listener": map[string]any{"type": "tcp"},
+                    "handler": map[string]any{"type": "forward"},
+                    "forwarder": map[string]any{"nodes": []map[string]any{{"name":"target", "addr": target}}},
+                    "metadata": map[string]any{"managedBy":"network-panel", "managedby":"network-panel"},
+                }
+                if iface != nil && *iface != "" { svc["metadata"].(map[string]any)["interface"] = *iface }
                 _ = sendWSCommand(nid, "AddService", []map[string]any{svc})
             }
             // Entry node: forward handler + chain to first mid address using dialer=grpc（负载将被各中间节点逐跳TCP转发）
@@ -147,7 +169,11 @@ func ForwardCreate(c *gin.Context) {
                     "addr":     fmt.Sprintf(":%d", f.InPort),
                     "listener": map[string]any{"type": "tcp"},
                     "handler":  map[string]any{"type": "forward", "chain": "chain_" + name},
-                    "metadata": map[string]any{"managedBy": "network-panel"},
+                    "metadata": map[string]any{"managedBy": "network-panel", "managedby": "network-panel"},
+                }
+                // attach interface for entry if configured
+                if ip, ok := ifaceMap[tun.InNodeID]; ok && ip != "" {
+                    if meta, ok2 := inSvc["metadata"].(map[string]any); ok2 { meta["interface"] = ip }
                 }
                 chainName := "chain_" + name
                 hopName := "hop_" + name
@@ -170,7 +196,7 @@ func ForwardCreate(c *gin.Context) {
                 "addr":     fmt.Sprintf(":%d", f.InPort),
                 "listener": map[string]any{"type": "tcp"},
                 "handler":  map[string]any{"type": "forward", "chain": "chain_" + name},
-                "metadata": map[string]any{"managedBy": "network-panel"},
+                "metadata": map[string]any{"managedBy": "network-panel", "managedby": "network-panel"},
             }
             chainName := "chain_" + name
             hopName := "hop_" + name
@@ -197,9 +223,13 @@ func ForwardCreate(c *gin.Context) {
     } else {
         // port-forward: support multi-level path
         path := getTunnelPathNodes(tun.ID)
+        ifaceMap := getTunnelIfaceMap(tun.ID)
         if len(path) == 0 {
             // single hop: in-node listens on inPort and forwards to remoteAddr
-            svc := buildServiceConfig(name, f.InPort, f.RemoteAddr, preferIface(f.InterfaceName, tun.InterfaceName))
+            var iface *string
+            // entry iface mapping takes precedence, then forward/interfaceName, then tunnel.interfaceName
+            if ip, ok := ifaceMap[tun.InNodeID]; ok && ip != "" { tmp := ip; iface = &tmp } else { iface = preferIface(f.InterfaceName, tun.InterfaceName) }
+            svc := buildServiceConfig(name, f.InPort, f.RemoteAddr, iface)
             _ = sendWSCommand(tun.InNodeID, "AddService", []map[string]any{svc})
             _ = sendWSCommand(tun.InNodeID, "RestartGost", map[string]any{"reason":"forward_create"})
         } else {
@@ -220,7 +250,9 @@ func ForwardCreate(c *gin.Context) {
                     // last hop forwards to final remote
                     target = f.RemoteAddr
                 }
-                svc := buildServiceConfig(name, f.InPort, target, preferIface(f.InterfaceName, tun.InterfaceName))
+                var iface *string
+                if ip, ok := ifaceMap[nodeID]; ok && ip != "" { tmp := ip; iface = &tmp } else { iface = preferIface(f.InterfaceName, tun.InterfaceName) }
+                svc := buildServiceConfig(name, f.InPort, target, iface)
                 _ = sendWSCommand(nodeID, "AddService", []map[string]any{svc})
             }
             // restart gost on all hops
@@ -273,9 +305,23 @@ func ForwardUpdate(c *gin.Context) {
 	if req.TunnelID != 0 {
 		f.TunnelID = req.TunnelID
 	}
-	if req.InPort != nil {
-		f.InPort = *req.InPort
-	}
+    if req.InPort != nil {
+        // enforce entry node port range; if out of range, try to pick a free one within
+        var node model.Node
+        _ = dbpkg.DB.First(&node, tun.InNodeID).Error
+        minP := 10000; maxP := 65535
+        if node.PortSta > 0 { minP = node.PortSta }
+        if node.PortEnd > 0 { maxP = node.PortEnd }
+        v := *req.InPort
+        if v < minP || v > maxP {
+            v = findFreePortOnNode(tun.InNodeID, 0, minP, maxP)
+            if v == 0 {
+                c.JSON(http.StatusOK, response.ErrMsg("入口端口超出范围且无法分配可用端口"))
+                return
+            }
+        }
+        f.InPort = v
+    }
 	if req.RemoteAddr != "" {
 		f.RemoteAddr = req.RemoteAddr
 	}
@@ -298,21 +344,28 @@ func ForwardUpdate(c *gin.Context) {
 				return
 			}
 		}
-		// update out-node TLS tunnel service
-		outSvc := map[string]any{
-			"name":     name,
-			"addr":     fmt.Sprintf(":%d", *f.OutPort),
-			"listener": map[string]any{"type": "tls"},
-			"handler":  map[string]any{"type": "rtcp"},
-			"metadata": map[string]any{"managedBy": "network-panel"},
-		}
+        // update out-node gRPC relay service
+        // apply bind IP (in IP) for exit if configured
+        bindMap := getTunnelBindMap(tun.ID)
+        addrStr := fmt.Sprintf(":%d", *f.OutPort)
+        if ip, ok := bindMap[outNodeIDOr0(tun)]; ok && ip != "" { addrStr = safeHostPort(ip, *f.OutPort) }
+        outSvc := map[string]any{
+            "name":     name,
+            "addr":     addrStr,
+            "listener": map[string]any{"type": "grpc"},
+            "handler":  map[string]any{"type": "relay", "auth": map[string]any{"username": fmt.Sprintf("u-%d", f.ID), "password": util.MD5(fmt.Sprintf("%d:%d", f.ID, f.CreatedTime))[:16]}},
+            "metadata": map[string]any{"managedBy": "network-panel", "managedby": "network-panel"},
+        }
         _ = sendWSCommand(outNodeIDOr0(tun), "AddService", []map[string]any{outSvc})
 
-        // update in-node entry service with chain(dialer=tls) and forwarder target=exitAddr
+        // update in-node entry service with chain(dialer=grpc, connector=relay) and forwarder target (remote)
         outIP := getOutNodeIP(tun)
         exitAddr := safeHostPort(outIP, *f.OutPort)
-        // 入口 forwarder 统一指向远程地址（取第一项）
-        inSvc := buildServiceConfig(name, f.InPort, firstTargetHost(f.RemoteAddr), preferIface(f.InterfaceName, tun.InterfaceName))
+        // 入口 forwarder 统一指向远程地址（取第一项），附带入口节点 interface（若配置）
+        ifaceMap := getTunnelIfaceMap(tun.ID)
+        var inIface *string
+        if ip, ok := ifaceMap[tun.InNodeID]; ok && ip != "" { tmp := ip; inIface = &tmp }
+        inSvc := buildServiceConfig(name, f.InPort, firstTargetHost(f.RemoteAddr), inIface)
         chainName := "chain_" + name
         hopName := "hop_" + name
         // ensure handler is forward and attach chain
@@ -322,7 +375,9 @@ func ForwardUpdate(c *gin.Context) {
         } else {
             inSvc["handler"] = map[string]any{"type":"forward","chain":chainName}
         }
-        node := map[string]any{"name": "exit-tls", "addr": exitAddr, "dialer": map[string]any{"type": "tls"}}
+        user := fmt.Sprintf("u-%d", f.ID)
+        pass := util.MD5(fmt.Sprintf("%d:%d", f.ID, f.CreatedTime))[:16]
+        node := map[string]any{"name": "node-" + name, "addr": exitAddr, "connector": map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}}, "dialer": map[string]any{"type": "grpc"}}
         inSvc["_chains"] = []any{map[string]any{"name": chainName, "hops": []any{map[string]any{"name": hopName, "nodes": []any{node}}}}}
         _ = sendWSCommand(tun.InNodeID, "UpdateService", []map[string]any{inSvc})
         // 强制重启入口与出口节点的 gost，确保更新立即生效
@@ -917,13 +972,13 @@ func buildServiceConfig(name string, listenPort int, target string, iface *strin
 			}},
 		},
 	}
-	// attach panel-managed marker and optional interface
-	meta := map[string]any{"managedBy": "network-panel"}
-	if iface != nil && *iface != "" {
-		meta["interface"] = *iface
-	}
-	svc["metadata"] = meta
-	return svc
+    // attach panel-managed marker (compat with both keys) and optional interface
+    meta := map[string]any{"managedBy": "network-panel", "managedby": "network-panel"}
+    if iface != nil && *iface != "" {
+        meta["interface"] = *iface
+    }
+    svc["metadata"] = meta
+    return svc
 }
 
 // ---- Helpers for multi-level tunnel: query in-use ports and pick free port ----
@@ -992,6 +1047,7 @@ func queryNodeServicesRaw(nodeID int64) []map[string]any {
 func findFreePortOnNode(nodeID int64, prefer int, min int, max int) int {
     used := queryNodeServicePorts(nodeID)
     start := prefer
+    if start < min || start > max { start = min }
     if start <= 0 { start = min }
     if start >= min && start <= max && !used[start] { return start }
     for p := start + 1; p <= max; p++ { if !used[p] { return p } }

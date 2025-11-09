@@ -131,55 +131,7 @@ check_and_install_diag_tools() {
     $SUDO_CMD systemctl stop iperf3 >/dev/null 2>&1 || true
   fi
 
-  # 如果 websocat 仍不可用，尝试从 GitHub 下载二进制
-  if ! command -v websocat >/dev/null 2>&1; then
-    install_websocat_from_github || true
-  fi
-}
-
-# 从 GitHub 下载 websocat 二进制（按架构尝试多个候选）
-install_websocat_from_github() {
-  local arch="$(uname -m)"
-  local base="https://github.com/vi/websocat/releases/latest/download"
-  if [[ -n "$PROXY_PREFIX" ]]; then base="${PROXY_PREFIX}${base}"; fi
-  local target="/usr/local/bin/websocat"
-  local tried=()
-  declare -a candidates
-  case "$arch" in
-    x86_64|amd64)
-      candidates=(
-        "websocat.x86_64-unknown-linux-musl"
-        "websocat.x86_64-unknown-linux-gnu"
-        "websocat_amd64-linux"
-        "websocat_linux_amd64"
-      ) ;;
-    aarch64|arm64)
-      candidates=(
-        "websocat.aarch64-unknown-linux-musl"
-        "websocat.aarch64-unknown-linux-gnu"
-        "websocat_arm64-linux"
-        "websocat_linux_arm64"
-      ) ;;
-    armv7l|armv7|armhf)
-      candidates=(
-        "websocat.armv7-unknown-linux-musleabihf"
-      ) ;;
-    *)
-      echo "⚠️ 未识别架构 $arch，跳过 websocat 安装" >&2
-      return 1 ;;
-  esac
-  for f in "${candidates[@]}"; do
-    tried+=("$f")
-    if curl -fsSL "$base/$f" -o "$target"; then
-      chmod +x "$target"
-      if "$target" -h >/dev/null 2>&1; then
-        echo "✅ websocat 安装成功 ($f)"
-        return 0
-      fi
-    fi
-  done
-  echo "❌ 尝试下载 websocat 失败: ${tried[*]}" >&2
-  return 1
+  # websocat 仅用于旧版 shell agent，当前默认使用 Go 版 flux-agent，无需安装 websocat
 }
 
 

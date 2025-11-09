@@ -100,6 +100,13 @@ export default function TunnelPage() {
   // 多级路径（中间节点按顺序）
   const [midPath, setMidPath] = useState<number[]>([]);
   const [addMidNodeId, setAddMidNodeId] = useState<number | ''>('');
+  // 入口与中间节点的接口IP选择（出站接口IP）
+  const [entryIface, setEntryIface] = useState<string>('');
+  const [midIfaces, setMidIfaces] = useState<Record<number,string>>({});
+  // 中间与出口节点的入站绑定IP（监听IP）
+  const [midBindIps, setMidBindIps] = useState<Record<number,string>>({});
+  const [exitBindIp, setExitBindIp] = useState<string>('');
+  const [ifaceCache, setIfaceCache] = useState<Record<number,string[]>>({});
   
   // 表单状态
   const [form, setForm] = useState<TunnelForm>({
@@ -158,6 +165,18 @@ export default function TunnelPage() {
     } finally {
       setLoading(false);
     }
+  };
+
+  // 拉取指定节点的接口IP并缓存
+  const fetchNodeIfaces = async (nodeId:number) => {
+    if (!nodeId) return [] as string[];
+    if (ifaceCache[nodeId]) return ifaceCache[nodeId];
+    try{
+      const r:any = await getNodeInterfaces(nodeId);
+      const ips = (r.code===0 && Array.isArray(r.data?.ips)) ? r.data.ips as string[] : [];
+      setIfaceCache(prev=>({...prev, [nodeId]: ips}));
+      return ips;
+    }catch{ return [] }
   };
 
   // 表单验证
@@ -222,6 +241,7 @@ export default function TunnelPage() {
     setErrors({});
     setMidPath([]);
     setAddMidNodeId('');
+    setEntryIface(''); setMidIfaces({}); setIfaceCache({});
     setExitPort(null); setExitPassword(""); setExitMethod("AEAD_CHACHA20_POLY1305"); setExitObserver("console"); setExitLimiter(""); setExitRLimiter(""); setExitDeployed(""); setExitMetaItems([]);
     setModalOpen(true);
   };
@@ -250,6 +270,22 @@ export default function TunnelPage() {
     (async ()=>{ try { const { getTunnelPath } = await import('@/api'); const r:any = await getTunnelPath(tunnel.id); if (r.code===0 && Array.isArray(r.data?.path)) setMidPath(r.data.path); } catch {} })();
     setExitPort(null); setExitPassword(""); setExitMethod("AEAD_CHACHA20_POLY1305"); setExitObserver("console"); setExitLimiter(""); setExitRLimiter(""); setExitDeployed(""); setExitMetaItems([]);
     setModalOpen(true);
+    // 读取已保存的每节点接口IP
+    (async()=>{
+      try{ const { getTunnelIface } = await import('@/api'); const r:any = await getTunnelIface(tunnel.id);
+        if (r.code===0 && Array.isArray(r.data?.ifaces)){
+          const map:Record<number,string> = {}; r.data.ifaces.forEach((x:any)=>{ if(x?.nodeId) map[Number(x.nodeId)] = String(x.ip||''); });
+          setMidIfaces(map);
+        }
+      }catch{}
+      try{ const { getTunnelBind } = await import('@/api'); const r:any = await getTunnelBind(tunnel.id);
+        if (r.code===0 && Array.isArray(r.data?.binds)){
+          const map:Record<number,string> = {}; r.data.binds.forEach((x:any)=>{ if(x?.nodeId) map[Number(x.nodeId)] = String(x.ip||''); });
+          setMidBindIps(map);
+          if (tunnel.outNodeId && map[tunnel.outNodeId]) setExitBindIp(map[tunnel.outNodeId]);
+        }
+      }catch{}
+    })();
   };
 
   // 删除隧道
@@ -304,19 +340,27 @@ export default function TunnelPage() {
         : await createTunnel(data);
         
       if (response.code === 0) {
-        // 保存多级路径
+        // 保存多级路径、每节点出站接口IP、以及每节点监听IP（仅隧道转发）
         try {
-          const { setTunnelPath, getTunnelList } = await import('@/api');
-          if (isEdit && form.id && midPath.length>0) {
-            await setTunnelPath(form.id, midPath);
-          } else if (!isEdit && midPath.length>0) {
-            // 创建后尝试解析新隧道ID：按名称与入口节点匹配，取ID最大的一条
+          const { setTunnelPath, getTunnelList, setTunnelIface, setTunnelBind } = await import('@/api');
+          let tid = isEdit ? form.id : undefined;
+          if (!tid) {
             const lr:any = await getTunnelList();
             if (lr && lr.code===0 && Array.isArray(lr.data)) {
               const candidates = (lr.data as any[]).filter(x=>x.name===form.name && x.inNodeId===form.inNodeId);
-              const tid = candidates.length>0 ? candidates.sort((a,b)=> (b.id||0)-(a.id||0))[0].id : undefined;
-              if (tid) { await setTunnelPath(tid, midPath); }
+              tid = candidates.length>0 ? candidates.sort((a,b)=> (b.id||0)-(a.id||0))[0].id : undefined;
             }
+          }
+          if (form.type===2 && tid) {
+            if (midPath.length>0) await setTunnelPath(tid as number, midPath);
+            const ifaces: Array<{nodeId:number, ip:string}> = [];
+            if (form.inNodeId) ifaces.push({ nodeId: form.inNodeId, ip: entryIface||'' });
+            midPath.forEach(nid=>{ ifaces.push({ nodeId: nid, ip: midIfaces[nid]||'' }); });
+            if (ifaces.length>0) await setTunnelIface(tid as number, ifaces);
+            const binds: Array<{nodeId:number, ip:string}> = [];
+            midPath.forEach(nid=>{ binds.push({ nodeId: nid, ip: (midBindIps[nid]||'') }); });
+            if (form.outNodeId) binds.push({ nodeId: form.outNodeId, ip: (exitBindIp||'') });
+            if (binds.length>0) await setTunnelBind(tid as number, binds);
           }
         } catch {}
         toast.success(isEdit ? '更新成功' : '创建成功');
@@ -493,7 +537,7 @@ export default function TunnelPage() {
 
         {/* 隧道卡片网格 */}
         {tunnels.length > 0 ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-2 2xl:grid-cols-3 gap-4">
             {tunnels.map((tunnel) => {
               const statusDisplay = getStatusDisplay(tunnel.status);
               const typeDisplay = getTypeDisplay(tunnel.type);
@@ -882,6 +926,23 @@ export default function TunnelPage() {
                     {form.type === 2 && (
                       <div className="mt-2">
                         <h3 className="text-base font-semibold mb-1">多级路径</h3>
+                        {/* 入口接口选择 */}
+                        <div className="mb-2 text-sm">
+                          <div className="flex items-center gap-2">
+                            <span className="text-default-600">入口出口IP</span>
+                            <Select
+                              size="sm"
+                              className="max-w-[260px]"
+                              selectedKeys={entryIface? [entryIface]: []}
+                              onOpenChange={async()=>{ await fetchNodeIfaces(form.inNodeId||0); }}
+                              onSelectionChange={(keys)=>{ const k=Array.from(keys)[0] as string; setEntryIface(k||''); }}
+                            >
+                              {(ifaceCache[form.inNodeId||0]||[]).map(ip=> (
+                                <SelectItem key={ip}>{ip}</SelectItem>
+                              ))}
+                            </Select>
+                          </div>
+                        </div>
                         <div className="flex items-center gap-2 mb-2">
                           <Select
                             label="添加中间节点"
@@ -901,20 +962,52 @@ export default function TunnelPage() {
                         {midPath.length===0 ? (
                           <div className="text-xs text-default-500">未配置中间节点</div>
                         ) : (
-                          <div className="space-y-2">
+                          <div className="space-y-3">
                             {midPath.map((nid, idx)=>{
                               const n = nodes.find(x=>x.id===nid);
                               return (
-                                <div key={nid} className="flex items-center gap-2 text-sm">
-                                  <div className="flex-1">{idx+1}. {n?.name || `节点${nid}`}</div>
-                                  <div className="flex items-center gap-1">
-                                    <Button size="sm" variant="flat" onPress={()=>{
-                                      setMidPath(prev=>{ const i=prev.indexOf(nid); if(i<=0) return prev.slice(); const arr=prev.slice(); const t=arr[i-1]; arr[i-1]=arr[i]; arr[i]=t; return arr; });
-                                    }}>上移</Button>
-                                    <Button size="sm" variant="flat" onPress={()=>{
-                                      setMidPath(prev=>{ const i=prev.indexOf(nid); if(i<0||i>=prev.length-1) return prev.slice(); const arr=prev.slice(); const t=arr[i+1]; arr[i+1]=arr[i]; arr[i]=t; return arr; });
-                                    }}>下移</Button>
-                                    <Button size="sm" color="danger" variant="flat" onPress={()=> setMidPath(prev=>prev.filter(id=>id!==nid))}>移除</Button>
+                                <div key={nid} className="w-full border border-dashed rounded-md p-3">
+                                  <div className="flex items-center justify-between mb-2">
+                                    <div className="font-medium">{idx+1}. {n?.name || `节点${nid}`}</div>
+                                    <div className="flex items-center gap-1">
+                                      <Button size="sm" variant="flat" onPress={()=>{
+                                        setMidPath(prev=>{ const i=prev.indexOf(nid); if(i<=0) return prev.slice(); const arr=prev.slice(); const t=arr[i-1]; arr[i-1]=arr[i]; arr[i]=t; return arr; });
+                                      }}>上移</Button>
+                                      <Button size="sm" variant="flat" onPress={()=>{
+                                        setMidPath(prev=>{ const i=prev.indexOf(nid); if(i<0||i>=prev.length-1) return prev.slice(); const arr=prev.slice(); const t=arr[i+1]; arr[i+1]=arr[i]; arr[i]=t; return arr; });
+                                      }}>下移</Button>
+                                      <Button size="sm" color="danger" variant="flat" onPress={()=> setMidPath(prev=>prev.filter(id=>id!==nid))}>移除</Button>
+                                    </div>
+                                  </div>
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                    <Select
+                                      aria-label="选择出站IP(接口)"
+                                      label="出站IP(接口)"
+                                      size="sm"
+                                      selectedKeys={midIfaces[nid]? [midIfaces[nid]]: []}
+                                      onOpenChange={async()=>{ await fetchNodeIfaces(nid); }}
+                                      onSelectionChange={(keys)=>{
+                                        const k = Array.from(keys)[0] as string; setMidIfaces(prev=>({...prev, [nid]: k||''}));
+                                      }}
+                                    >
+                                      {(ifaceCache[nid]||[]).map(ip=> (
+                                        <SelectItem key={ip}>{ip}</SelectItem>
+                                      ))}
+                                    </Select>
+                                    <Select
+                                      aria-label="选择监听IP(入站)"
+                                      label="监听IP(入站)"
+                                      size="sm"
+                                      selectedKeys={midBindIps[nid]? [midBindIps[nid]]: []}
+                                      onOpenChange={async()=>{ await fetchNodeIfaces(nid); }}
+                                      onSelectionChange={(keys)=>{
+                                        const k = Array.from(keys)[0] as string; setMidBindIps(prev=>({...prev, [nid]: k||''}));
+                                      }}
+                                    >
+                                      {(ifaceCache[nid]||[]).map(ip=> (
+                                        <SelectItem key={ip}>{ip}</SelectItem>
+                                      ))}
+                                    </Select>
                                   </div>
                                 </div>
                               );
@@ -925,22 +1018,23 @@ export default function TunnelPage() {
                       </div>
                     )}
 
-                    {/* 隧道转发时显示出口网卡配置 */}
+                    {/* 隧道转发时显示出口监听IP（下拉选择） */}
                     {form.type === 2 && (
                       <div className="space-y-2">
-                        <Input
-                          label="出口网卡名或IP"
-                          placeholder="可从下方列表选择或手动输入"
-                          value={form.interfaceName}
-                          onChange={(e) => setForm(prev => ({ ...prev, interfaceName: e.target.value }))}
-                          isInvalid={!!errors.interfaceName}
-                          errorMessage={errors.interfaceName}
+                        <Select
+                          label="出口监听IP"
+                          placeholder="请选择出口监听IP"
+                          selectedKeys={exitBindIp ? [exitBindIp] : []}
+                          onOpenChange={async()=>{ if (form.outNodeId) await fetchNodeIfaces(form.outNodeId); }}
+                          onSelectionChange={(keys)=>{
+                            const k = Array.from(keys)[0] as string; setExitBindIp(k||'');
+                          }}
                           variant="bordered"
-                        />
-                        {/* 出口节点IP选择（agent上报）*/}
-                        {form.outNodeId && (
-                          <IfacePicker nodeId={form.outNodeId} onSelect={(ip)=>setForm(prev=>({...prev, interfaceName: ip}))} />
-                        )}
+                        >
+                          {(ifaceCache[form.outNodeId||0]||[]).map(ip=> (
+                            <SelectItem key={ip}>{ip}</SelectItem>
+                          ))}
+                        </Select>
                       </div>
                     )}
 
@@ -1303,26 +1397,4 @@ export default function TunnelPage() {
   );
 }
 
-function IfacePicker({ nodeId, onSelect }: { nodeId: number; onSelect: (ip:string)=>void }) {
-  const [ips, setIps] = useState<string[]>([]);
-  const [loading, setLoading] = useState(false);
-  useEffect(() => {
-    let mounted = true;
-    setLoading(true);
-    getNodeInterfaces(nodeId).then((res:any)=>{
-      if (!mounted) return;
-      const lis = res.code===0 && Array.isArray(res.data?.ips) ? res.data.ips as string[] : [];
-      setIps(lis);
-    }).catch(()=>{ if (mounted) setIps([]); }).finally(()=>{ if (mounted) setLoading(false); });
-    return ()=>{ mounted=false };
-  }, [nodeId]);
-  if (loading) return <div className="text-xs text-default-500">加载接口IP...</div>;
-  if (!ips.length) return <div className="text-xs text-default-400">未获取到接口IP</div>;
-  return (
-    <div className="flex gap-2 flex-wrap">
-      {ips.map(ip => (
-        <button key={ip} className="px-2 py-1 text-xs rounded bg-default-100 hover:bg-default-200" onClick={()=>onSelect(ip)}>{ip}</button>
-      ))}
-    </div>
-  );
-}
+// (exit IP picker now unified as Select in form; standalone IfacePicker removed)

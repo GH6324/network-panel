@@ -46,6 +46,9 @@ import {
   updateForwardOrder,
   getNodeInterfaces,
   getTunnelById,
+  getTunnelPath,
+  getTunnelBind,
+  setTunnelBind,
 } from "@/api";
 import { JwtUtil } from "@/utils/jwt";
 
@@ -210,6 +213,22 @@ export default function ForwardPage() {
   // 表单验证错误
   const [errors, setErrors] = useState<{[key: string]: string}>({});
   const [selectedTunnel, setSelectedTunnel] = useState<Tunnel | null>(null);
+  // 监听IP（入站）配置（仅隧道转发）
+  const [midPath, setMidPath] = useState<number[]>([]);
+  const [midBindIps, setMidBindIps] = useState<Record<number,string>>({});
+  const [exitBindIp, setExitBindIp] = useState<string>('');
+  const [ifaceCache, setIfaceCache] = useState<Record<number,string[]>>({});
+
+  const fetchNodeIfaces = async (nodeId:number) => {
+    if (!nodeId) return [] as string[];
+    if (ifaceCache[nodeId]) return ifaceCache[nodeId];
+    try{
+      const r:any = await getNodeInterfaces(nodeId);
+      const ips = (r.code===0 && Array.isArray(r.data?.ips)) ? r.data.ips as string[] : [];
+      setIfaceCache(prev=>({...prev, [nodeId]: ips}));
+      return ips;
+    }catch{ return [] }
+  };
 
   useEffect(() => {
     loadData();
@@ -224,7 +243,6 @@ export default function ForwardPage() {
         try {
           const t = selectedTunnel;
           if (!t) { setLoading(false); return; }
-          // 拉取隧道详情，判断类型与节点
           const dt:any = await getTunnelById(t.id);
           if (dt.code !== 0 || !dt.data) { setLoading(false); return; }
           const type = dt.data.type;
@@ -237,13 +255,17 @@ export default function ForwardPage() {
       load();
     }, [selectedTunnel?.id]);
     if (loading) return <div className="text-xs text-default-500">加载接口IP...</div>;
-    if (!ips.length) return <div className="text-xs text-default-400">未获取到接口IP</div>;
     return (
-      <div className="flex gap-2 flex-wrap">
-        {ips.map(ip => (
-          <button key={ip} className="px-2 py-1 text-xs rounded bg-default-100 hover:bg-default-200" onClick={()=>onSelect(ip)}>{ip}</button>
-        ))}
-      </div>
+      <Select
+        label="出口IP"
+        placeholder={ips.length? '请选择出口IP' : '未获取到接口IP'}
+        selectedKeys={[]}
+        onSelectionChange={(keys)=>{ const k = Array.from(keys)[0] as string; if (k) onSelect(k); }}
+        variant="bordered"
+        size="sm"
+      >
+        {ips.map(ip => (<SelectItem key={ip}>{ip}</SelectItem>))}
+      </Select>
     );
   }
 
@@ -559,6 +581,30 @@ export default function ForwardPage() {
     const tunnel = tunnels.find(t => t.id === parseInt(tunnelId));
     setSelectedTunnel(tunnel || null);
     setForm(prev => ({ ...prev, tunnelId: parseInt(tunnelId) }));
+    // 加载多级路径与已保存监听IP（仅隧道转发）
+    (async()=>{
+      try{
+        if (tunnel && (tunnel as any).type === 2){
+          const rp:any = await getTunnelPath(tunnel.id);
+          const path:number[] = (rp.code===0 && Array.isArray(rp.data?.path)) ? rp.data.path as number[] : [];
+          setMidPath(path);
+          const rb:any = await getTunnelBind(tunnel.id);
+          const bindMap:Record<number,string> = {};
+          if (rb.code===0 && Array.isArray(rb.data?.binds)){
+            rb.data.binds.forEach((x:any)=>{ if(x?.nodeId) bindMap[Number(x.nodeId)] = String(x.ip||''); });
+          }
+          setMidBindIps(bindMap);
+          if ((tunnel as any).outNodeId && bindMap[(tunnel as any).outNodeId]) setExitBindIp(bindMap[(tunnel as any).outNodeId]); else setExitBindIp('');
+          // 预取接口IP
+          if ((tunnel as any).outNodeId) await fetchNodeIfaces((tunnel as any).outNodeId);
+          for (const nid of path){ await fetchNodeIfaces(nid); }
+        } else {
+          setMidPath([]); setMidBindIps({}); setExitBindIp('');
+        }
+      }catch{
+        setMidPath([]); setMidBindIps({}); setExitBindIp('');
+      }
+    })();
   };
 
   // 提交表单
@@ -610,6 +656,16 @@ export default function ForwardPage() {
       
       if (res.code === 0) {
         toast.success(isEdit ? '修改成功' : '创建成功');
+        // 保存监听IP映射（仅隧道转发）
+        try{
+          const tid = (selectedTunnel && (selectedTunnel as any).type===2) ? (selectedTunnel.id) : 0;
+          if (tid) {
+            const binds: Array<{nodeId:number, ip:string}> = [];
+            midPath.forEach(nid=>{ binds.push({ nodeId: nid, ip: midBindIps[nid]||'' }); });
+            if ((selectedTunnel as any).outNodeId) binds.push({ nodeId: (selectedTunnel as any).outNodeId, ip: exitBindIp||'' });
+            if (binds.length>0) await setTunnelBind(tid, binds);
+          }
+        }catch{}
         setModalOpen(false);
         loadData();
       } else {
@@ -1666,17 +1722,45 @@ export default function ForwardPage() {
                       maxRows={6}
                     />
                     
-                    <Input
-                      label="出口网卡名或IP"
-                      placeholder="可从下方列表选择或手动输入"
-                      value={form.interfaceName}
-                      onChange={(e) => setForm(prev => ({ ...prev, interfaceName: e.target.value }))}
-                      isInvalid={!!errors.interfaceName}
-                      errorMessage={errors.interfaceName}
-                      variant="bordered"
-                      description="用于多IP服务器指定使用那个IP请求远程地址，不懂的默认为空就行"
-                    />
                     <ForwardIfacePicker selectedTunnel={selectedTunnel} onSelect={(ip)=>setForm(prev=>({...prev, interfaceName: ip}))} />
+
+                    {selectedTunnel && (selectedTunnel as any).type===2 && (
+                      <div className="space-y-3">
+                        <Divider />
+                        <h3 className="text-base font-semibold">监听IP（仅隧道转发）</h3>
+                        {(selectedTunnel as any).outNodeId && (
+                          <Select
+                            label="出口监听IP"
+                            placeholder="请选择出口监听IP"
+                            selectedKeys={exitBindIp ? [exitBindIp] : []}
+                            onOpenChange={async()=>{ await fetchNodeIfaces((selectedTunnel as any).outNodeId); }}
+                            onSelectionChange={(keys)=>{ const k = Array.from(keys)[0] as string; setExitBindIp(k||''); }}
+                            variant="bordered"
+                          >
+                            {(ifaceCache[(selectedTunnel as any).outNodeId]||[]).map(ip=> (<SelectItem key={ip}>{ip}</SelectItem>))}
+                          </Select>
+                        )}
+                        {midPath.length>0 && (
+                          <div className="space-y-2">
+                            {midPath.map(nid => (
+                              <div key={nid} className="flex items-center gap-2 text-sm">
+                                <div className="w-24 text-default-600">节点 {nid}</div>
+                                <Select
+                                  aria-label="选择监听IP(入站)"
+                                  size="sm"
+                                  className="max-w-[260px]"
+                                  selectedKeys={midBindIps[nid]? [midBindIps[nid]]: []}
+                                  onOpenChange={async()=>{ await fetchNodeIfaces(nid); }}
+                                  onSelectionChange={(keys)=>{ const k = Array.from(keys)[0] as string; setMidBindIps(prev=>({...prev, [nid]: k||''})); }}
+                                >
+                                  {(ifaceCache[nid]||[]).map(ip=> (<SelectItem key={ip}>{ip}</SelectItem>))}
+                                </Select>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     
                     {getAddressCount(form.remoteAddr) > 1 && (
                       <Select

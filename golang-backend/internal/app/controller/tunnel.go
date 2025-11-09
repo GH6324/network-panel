@@ -465,6 +465,7 @@ func TunnelDiagnoseStep(c *gin.Context) {
         }
         // 2) 沿路径临时搭建端口直转链路（入口 → 中间... → 最后 → 出口的 iperf3 端口）
         path := getTunnelPathNodes(t.ID)
+        ifaceMap := getTunnelIfaceMap(t.ID)
         fNodes := make([]int64, 0, 1+len(path))
         fNodes = append(fNodes, inNode.ID)
         fNodes = append(fNodes, path...)
@@ -498,7 +499,9 @@ func TunnelDiagnoseStep(c *gin.Context) {
             } else {
                 target = safeHostPort(exitIP, srvPort)
             }
-            svc := buildServiceConfig(tmpNames[i], tmpPorts[i], target, nil)
+            var iface *string
+            if ip, ok := ifaceMap[nid]; ok && ip != "" { tmp := ip; iface = &tmp }
+            svc := buildServiceConfig(tmpNames[i], tmpPorts[i], target, iface)
             _ = sendWSCommand(nid, "AddService", []map[string]any{svc})
             jlog(map[string]any{"event":"iperf3_tmp_add","tunnelId": t.ID, "nodeId": nid, "name": tmpNames[i], "listen": tmpPorts[i], "target": target})
         }

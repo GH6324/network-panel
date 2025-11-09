@@ -410,8 +410,8 @@ func convertSysInfoJSON(b []byte) map[string]interface{} {
 	if err := json.Unmarshal(b, &in); err != nil {
 		return nil
 	}
-	// map known fields to snake_case expected by frontend
-	out := map[string]interface{}{}
+    // map known fields to snake_case expected by frontend
+    out := map[string]interface{}{}
 	if v, ok := in["Uptime"]; ok {
 		out["uptime"] = v
 	} else if v, ok := in["uptime"]; ok {
@@ -432,12 +432,18 @@ func convertSysInfoJSON(b []byte) map[string]interface{} {
 	} else if v, ok := in["cpu_usage"]; ok {
 		out["cpu_usage"] = v
 	}
-	if v, ok := in["MemoryUsage"]; ok {
-		out["memory_usage"] = v
-	} else if v, ok := in["memory_usage"]; ok {
-		out["memory_usage"] = v
-	}
-	return out
+    if v, ok := in["MemoryUsage"]; ok {
+        out["memory_usage"] = v
+    } else if v, ok := in["memory_usage"]; ok {
+        out["memory_usage"] = v
+    }
+    // interfaces list (array of IP strings)
+    if v, ok := in["Interfaces"]; ok {
+        out["interfaces"] = v
+    } else if v, ok := in["interfaces"]; ok {
+        out["interfaces"] = v
+    }
+    return out
 }
 
 // storeSysInfoSample persists a sysinfo payload into node_sysinfo table

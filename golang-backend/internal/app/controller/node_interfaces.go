@@ -1,12 +1,13 @@
 package controller
 
 import (
-	"net/http"
+    "encoding/json"
+    "net/http"
 
-	"github.com/gin-gonic/gin"
-	"network-panel/golang-backend/internal/app/model"
-	"network-panel/golang-backend/internal/app/response"
-	dbpkg "network-panel/golang-backend/internal/db"
+    "github.com/gin-gonic/gin"
+    "network-panel/golang-backend/internal/app/model"
+    "network-panel/golang-backend/internal/app/response"
+    dbpkg "network-panel/golang-backend/internal/db"
 )
 
 // POST /api/v1/node/interfaces {nodeId}
@@ -18,10 +19,16 @@ func NodeInterfaces(c *gin.Context) {
 		c.JSON(http.StatusOK, response.ErrMsg("参数错误"))
 		return
 	}
-	var r model.NodeRuntime
-	if err := dbpkg.DB.First(&r, "node_id = ?", p.NodeID).Error; err != nil || r.Interfaces == nil {
-		c.JSON(http.StatusOK, response.Ok(map[string]any{"ips": []string{}}))
-		return
-	}
-	c.JSON(http.StatusOK, response.Ok(map[string]any{"ips": r.Interfaces}))
+    var r model.NodeRuntime
+    if err := dbpkg.DB.First(&r, "node_id = ?", p.NodeID).Error; err != nil || r.Interfaces == nil {
+        c.JSON(http.StatusOK, response.Ok(map[string]any{"ips": []string{}}))
+        return
+    }
+    // r.Interfaces stores a JSON array string; decode to []string for frontend
+    var arr []string
+    if err := json.Unmarshal([]byte(*r.Interfaces), &arr); err != nil {
+        c.JSON(http.StatusOK, response.Ok(map[string]any{"ips": []string{}}))
+        return
+    }
+    c.JSON(http.StatusOK, response.Ok(map[string]any{"ips": arr}))
 }

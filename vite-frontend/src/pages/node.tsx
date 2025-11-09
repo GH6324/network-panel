@@ -838,7 +838,7 @@ export default function NodePage() {
             </CardBody>
           </Card>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-2 2xl:grid-cols-3 gap-4">
             {nodeList.map((node) => (
               <Card 
                 key={node.id} 
@@ -865,7 +865,7 @@ export default function NodePage() {
 
                 <CardBody className="pt-0 pb-3">
                   {/* 基础信息 */}
-                  <div className="space-y-2 mb-4">
+                  <div className="space-y-2 mb-4" onClick={() => goNetwork(node)} style={{ cursor: 'pointer' }}>
                     <div className="flex justify-between items-center text-sm min-w-0">
                       <span className="text-default-600 flex-shrink-0">入口IP</span>
                       <div className="text-right text-xs min-w-0 flex-1 ml-2">
@@ -1038,25 +1038,6 @@ export default function NodePage() {
                         className="flex-1 min-h-8"
                       >
                         出口
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="flat"
-                        color="secondary"
-                        onPress={() => goNetwork(node)}
-                        className="flex-1 min-h-8"
-                      >
-                        网络
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="flat"
-                        color="secondary"
-                        onPress={() => refreshServices(node)}
-                        isLoading={node.ssLoading}
-                        className="flex-1 min-h-8"
-                      >
-                        服务
                       </Button>
                       <Button
                         size="sm"
