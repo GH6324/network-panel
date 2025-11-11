@@ -114,7 +114,7 @@ func ForwardCreate(c *gin.Context) {
 			"listener": map[string]any{"type": "grpc"},
 			// 出口不再配置 chain，仅作为 relay 服务端
 			"handler":  map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}},
-			"metadata": map[string]any{"managedBy": "network-panel", "managedby": "network-panel"},
+			"metadata": map[string]any{"managedBy": "network-panel"},
 		}
 		_ = sendWSCommand(outNodeIDOr0(tun), "AddService", []map[string]any{outSvc})
 
@@ -208,16 +208,16 @@ func ForwardCreate(c *gin.Context) {
 				}
 				// bind IP (in IP) for mids and exit (nid != entry)
 				addrStr := fmt.Sprintf(":%d", thisPort)
-				if bindIP, ok := bindMap[nid]; ok && bindIP != "" {
+				/*if bindIP, ok := bindMap[nid]; ok && bindIP != "" {
 					addrStr = safeHostPort(bindIP, thisPort)
-				}
+				}*/
 				svc := map[string]any{
 					"name":      midName,
 					"addr":      addrStr,
 					"listener":  map[string]any{"type": "tcp"},
 					"handler":   map[string]any{"type": "forward"},
 					"forwarder": map[string]any{"nodes": []map[string]any{{"name": "target", "addr": target}}},
-					"metadata":  map[string]any{"managedBy": "network-panel", "managedby": "network-panel"},
+					"metadata":  map[string]any{"managedBy": "network-panel"},
 				}
 				if iface != nil && *iface != "" {
 					svc["metadata"].(map[string]any)["interface"] = *iface
@@ -236,7 +236,7 @@ func ForwardCreate(c *gin.Context) {
 					"addr":     fmt.Sprintf(":%d", f.InPort),
 					"listener": map[string]any{"type": "tcp"},
 					"handler":  map[string]any{"type": "forward", "chain": "chain_" + name},
-					"metadata": map[string]any{"managedBy": "network-panel", "managedby": "network-panel"},
+					"metadata": map[string]any{"managedBy": "network-panel"},
 				}
 				// attach interface for entry if configured
 				if ip, ok := ifaceMap[tun.InNodeID]; ok && ip != "" {
@@ -274,7 +274,7 @@ func ForwardCreate(c *gin.Context) {
 				"addr":     fmt.Sprintf(":%d", f.InPort),
 				"listener": map[string]any{"type": "tcp"},
 				"handler":  map[string]any{"type": "forward", "chain": "chain_" + name},
-				"metadata": map[string]any{"managedBy": "network-panel", "managedby": "network-panel"},
+				"metadata": map[string]any{"managedBy": "network-panel"},
 			}
 			chainName := "chain_" + name
 			hopName := "hop_" + name
@@ -512,7 +512,7 @@ func ForwardUpdate(c *gin.Context) {
 			"addr":     addrStr,
 			"listener": map[string]any{"type": "grpc"},
 			"handler":  map[string]any{"type": "relay", "auth": map[string]any{"username": fmt.Sprintf("u-%d", f.ID), "password": util.MD5(fmt.Sprintf("%d:%d", f.ID, f.CreatedTime))[:16]}},
-			"metadata": map[string]any{"managedBy": "network-panel", "managedby": "network-panel"},
+			"metadata": map[string]any{"managedBy": "network-panel"},
 		}
 		_ = sendWSCommand(outNodeIDOr0(tun), "AddService", []map[string]any{outSvc})
 		if b, err := json.Marshal(outSvc); err == nil {
@@ -599,7 +599,7 @@ func ForwardUpdate(c *gin.Context) {
 					"listener":  map[string]any{"type": "tcp"},
 					"handler":   map[string]any{"type": "forward"},
 					"forwarder": map[string]any{"nodes": []map[string]any{{"name": "target", "addr": target}}},
-					"metadata":  map[string]any{"managedBy": "network-panel", "managedby": "network-panel"},
+					"metadata":  map[string]any{"managedBy": "network-panel"},
 				}
 				if iface != nil && *iface != "" {
 					svc["metadata"].(map[string]any)["interface"] = *iface
@@ -1287,7 +1287,7 @@ func buildServiceConfig(name string, listenPort int, target string, iface *strin
 		},
 	}
 	// attach panel-managed marker (compat with both keys) and optional interface
-	meta := map[string]any{"managedBy": "network-panel", "managedby": "network-panel"}
+	meta := map[string]any{"managedBy": "network-panel"}
 	if iface != nil && *iface != "" {
 		meta["interface"] = *iface
 	}

@@ -33,7 +33,7 @@ var (
 
 // versionBase is the agent semantic version (without role prefix).
 // final reported version is: go-agent-<versionBase> or go-agent2-<versionBase>
-var versionBase = "1.0.6"
+var versionBase = "1.0.6.1"
 var version = "" // computed in main()
 
 func isAgent2Binary() bool {
@@ -1127,8 +1127,8 @@ func runICMP(host string, count, timeoutMs int) (avg int, loss int) {
 
 func pickPort() int {
 	rand.Seed(time.Now().UnixNano())
-	for i := 0; i < 20; i++ {
-		p := 20000 + rand.Intn(20000)
+	for i := 0; i < 100; i++ {
+		p := 10000 + rand.Intn(20000)
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
 		if err == nil {
 			_ = ln.Close()

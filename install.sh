@@ -15,8 +15,8 @@ show_menu() {
   echo "==============================================="
   echo "请选择操作："
   echo "1. 安装"
-  echo "2. 更新"  
-  echo "3. 卸载"
+  echo "2. 更新 (自动识别二进制/Docker)"  
+  echo "3. 卸载 (自动识别二进制/Docker)"
   echo "4. 退出"
   echo "==============================================="
 }
@@ -132,6 +132,84 @@ check_and_install_diag_tools() {
   fi
 
   # websocat 仅用于旧版 shell agent，当前默认使用 Go 版 flux-agent，无需安装 websocat
+}
+
+# --- 安装方式检测与 Docker 辅助 ---
+# 返回值：
+#   echo "binary" | "docker" | "none"
+detect_install_mode() {
+  # binary 判定：systemd 存在或二进制存在
+  if systemctl list-units --full -all 2>/dev/null | grep -Fq "gost.service" || [ -x "$INSTALL_DIR/gost" ]; then
+    echo "binary"; return
+  fi
+  # docker 判定：存在包含 gost 的容器（名称或镜像）
+  if command -v docker >/dev/null 2>&1; then
+    if docker ps -a --format '{{.ID}} {{.Image}} {{.Names}}' 2>/dev/null | grep -Ei '\bgost\b|go-gost' >/dev/null 2>&1; then
+      echo "docker"; return
+    fi
+  fi
+  echo "none"
+}
+
+# 选择一个 gost 容器（当存在多个时）
+pick_gost_container() {
+  docker ps -a --format '{{.ID}} {{.Image}} {{.Names}}' | grep -Ei '\bgost\b|go-gost' | head -n1 | awk '{print $3}'
+}
+
+# 使用 docker compose 方式更新（依据容器标签定位 compose 工程）
+docker_compose_update() {
+  local cn="$1"
+  local proj dir files svc
+  proj=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project"}}' "$cn" 2>/dev/null)
+  dir=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir"}}' "$cn" 2>/dev/null)
+  files=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files"}}' "$cn" 2>/dev/null)
+  svc=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service"}}' "$cn" 2>/dev/null)
+  if [[ -n "$proj" && -n "$dir" && -n "$files" && -n "$svc" ]]; then
+    ( cd "$dir" 2>/dev/null && \
+      docker compose -p "$proj" -f "$files" pull "$svc" && \
+      docker compose -p "$proj" -f "$files" up -d "$svc" )
+    return $?
+  fi
+  return 2
+}
+
+# 依据当前容器配置重建并更新镜像
+docker_update_recreate() {
+  local cn="$1"
+  local img opts="" envs ports binds net rp priv cmd ep
+  img=$(docker inspect -f '{{ .Config.Image }}' "$cn") || return 1
+  # 拉取最新镜像
+  docker pull "$img" || true
+  # 环境变量
+  envs=$(docker inspect "$cn" | jq -r '.[0].Config.Env[]? | "-e \(. )"')
+  # 端口映射（仅处理 HostPort 存在的 TCP/UDP 一般情况）
+  ports=$(docker inspect "$cn" | jq -r '
+    .[0].HostConfig.PortBindings // {} | to_entries[]? as $e |
+    ($e.key | split("/") | .[0]) as $cport |
+    $e.value[]? | "-p \((.HostIp // "") as $ip | if $ip != "" then "\($ip):" else "" end)\(.HostPort):\($cport)"')
+  if [[ -z "$ports" ]]; then
+    # fallback 简化：根据 .NetworkSettings.Ports 构建
+    ports=$(docker inspect "$cn" | jq -r '.[0].NetworkSettings.Ports // {} | to_entries[]? | select(.value!=null) | .value[]? | select(.HostPort) | "-p \(.HostPort):\(.key | split("/")[0])"')
+  fi
+  # volume 绑定
+  binds=$(docker inspect "$cn" | jq -r '.[0].HostConfig.Binds[]? | "-v \(.)"')
+  # 网络与重启策略
+  net=$(docker inspect -f '{{ .HostConfig.NetworkMode }}' "$cn" 2>/dev/null)
+  [[ -n "$net" && "$net" != "default" ]] && opts+=" --network $net"
+  rp=$(docker inspect -f '{{ .HostConfig.RestartPolicy.Name }}' "$cn" 2>/dev/null)
+  [[ -n "$rp" && "$rp" != "no" ]] && opts+=" --restart $rp"
+  priv=$(docker inspect -f '{{ .HostConfig.Privileged }}' "$cn" 2>/dev/null)
+  [[ "$priv" == "true" ]] && opts+=" --privileged"
+  # entrypoint & cmd
+  ep=$(docker inspect "$cn" | jq -r '.[0].Config.Entrypoint? | if type=="array" then ("--entrypoint \(.[0])") elif type=="string" then ("--entrypoint \(.)") else empty end')
+  cmd=$(docker inspect "$cn" | jq -r '.[0].Config.Cmd? | @sh' | sed "s/^'//;s/'$//")
+  # 停止并删除旧容器
+  docker stop "$cn" >/dev/null 2>&1 || true
+  docker rm "$cn" >/dev/null 2>&1 || true
+  # 运行新容器
+  # shellcheck disable=SC2086
+  docker run -d --name "$cn" $opts $envs $binds $ports ${ep:-} "$img" ${cmd:-} || return 1
+  return 0
 }
 
 
@@ -423,83 +501,87 @@ EOF
 # 更新功能
 update_gost() {
   echo "🔄 开始更新 GOST..."
-  
-  if [[ ! -d "$INSTALL_DIR" ]]; then
-    echo "❌ GOST 未安装，请先选择安装。"
+  local mode
+  mode=$(detect_install_mode)
+  if [[ "$mode" == "docker" ]]; then
+    if ! command -v docker >/dev/null 2>&1; then echo "❌ 未检测到 docker"; return 1; fi
+    # 需要 jq 解析容器配置
+    check_and_install_diag_tools
+    local cn
+    cn=$(pick_gost_container)
+    if [[ -z "$cn" ]]; then echo "❌ 未找到 gost 容器"; return 1; fi
+    echo "🐳 检测到 Docker 安装，容器: $cn"
+    # 优先使用 docker compose 重建
+    if docker_compose_update "$cn"; then
+      echo "✅ Docker Compose 更新完成"
+      return 0
+    fi
+    # 退化为重建容器
+    if docker_update_recreate "$cn"; then
+      echo "✅ Docker 容器已使用最新镜像重建并启动"
+      return 0
+    else
+      echo "❌ Docker 容器更新失败"
+      return 1
+    fi
+  elif [[ "$mode" == "binary" ]]; then
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+      echo "❌ GOST 未安装，请先选择安装。"; return 1
+    fi
+    # 检查并安装工具
+    check_and_install_tcpkill
+    check_and_install_diag_tools
+    # 停止服务
+    if systemctl list-units --full -all | grep -Fq "gost.service"; then
+      echo "🛑 停止 gost 服务..."; systemctl stop gost || true
+    fi
+    # 下载并安装最新版
+    echo "⬇️ 解析最新 GOST 下载地址..."
+    local GOST_URL
+    if ! GOST_URL=$(resolve_latest_gost_url); then echo "❌ 无法解析最新 GOST 下载地址"; return 1; fi
+    download_and_install_gost "$GOST_URL" || return 1
+    echo "🔎 新版本：$($INSTALL_DIR/gost -V || true)"
+    echo "🔄 重启服务..."; systemctl start gost || true
+    systemctl daemon-reload
+    systemctl restart flux-agent >/dev/null 2>&1 || systemctl start flux-agent >/dev/null 2>&1 || true
+    echo "✅ 更新完成，gost 与 flux-agent 均已重新启动。"
+    return 0
+  else
+    echo "ℹ️ 未检测到已安装的 GOST。"
     return 1
   fi
-  
-  # 检查并安装 tcpkill 与诊断工具（含 jq 用于解析版本）
-  check_and_install_tcpkill
-  check_and_install_diag_tools
-
-  # 停止服务
-  if systemctl list-units --full -all | grep -Fq "gost.service"; then
-    echo "🛑 停止 gost 服务..."
-    systemctl stop gost || true
-  fi
-
-  # 下载并安装最新版
-  echo "⬇️ 解析最新 GOST 下载地址..."
-  local GOST_URL
-  if ! GOST_URL=$(resolve_latest_gost_url); then
-    echo "❌ 无法解析最新 GOST 下载地址"; return 1
-  fi
-  download_and_install_gost "$GOST_URL" || return 1
-
-  echo "🔎 新版本：$($INSTALL_DIR/gost -V || true)"
-  echo "🔄 重启服务..."
-  systemctl start gost || true
-  # 同步重启 flux-agent，避免手动操作
-  systemctl daemon-reload
-  systemctl restart flux-agent >/dev/null 2>&1 || systemctl start flux-agent >/dev/null 2>&1 || true
-  echo "✅ 更新完成，gost 与 flux-agent 均已重新启动。"
 }
 
 # 卸载功能
 uninstall_gost() {
   echo "🗑️ 开始卸载 GOST..."
-  
   read -p "确认卸载 GOST 吗？此操作将删除所有相关文件 (y/N): " confirm
-  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-    echo "❌ 取消卸载"
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then echo "❌ 取消卸载"; return 0; fi
+  local mode; mode=$(detect_install_mode)
+  if [[ "$mode" == "docker" ]]; then
+    if ! command -v docker >/dev/null 2>&1; then echo "❌ 未检测到 docker"; return 1; fi
+    # 批量处理所有匹配 gost 的容器
+    local lines; lines=$(docker ps -a --format '{{.Names}}' | grep -Ei '\bgost\b|go-gost' || true)
+    if [[ -z "$lines" ]]; then echo "ℹ️ 未找到 gost 容器"; else
+      echo "$lines" | while read -r cn; do
+        echo "🛑 停止容器: $cn"; docker stop "$cn" >/dev/null 2>&1 || true
+        echo "🧹 删除容器: $cn"; docker rm "$cn" >/dev/null 2>&1 || true
+      done
+    fi
+    echo "✅ Docker 卸载完成"
     return 0
   fi
-
-  # 停止并禁用服务
+  # binary 卸载
   if systemctl list-units --full -all | grep -Fq "gost.service"; then
-    echo "🛑 停止并禁用服务..."
-    systemctl stop gost 2>/dev/null
-    systemctl disable gost 2>/dev/null
+    echo "🛑 停止并禁用服务..."; systemctl stop gost 2>/dev/null; systemctl disable gost 2>/dev/null
   fi
-
-  # 删除服务文件
-  if [[ -f "/etc/systemd/system/gost.service" ]]; then
-    rm -f "/etc/systemd/system/gost.service"
-    echo "🧹 删除服务文件"
-  fi
-
-  # 停止并卸载 flux-agent 服务
+  if [[ -f "/etc/systemd/system/gost.service" ]]; then rm -f "/etc/systemd/system/gost.service"; echo "🧹 删除服务文件"; fi
   if systemctl list-units --full -all | grep -Fq "flux-agent.service"; then
-    echo "🛑 停止并禁用 flux-agent 服务..."
-    systemctl stop flux-agent 2>/dev/null
-    systemctl disable flux-agent 2>/dev/null
-    rm -f "/etc/systemd/system/flux-agent.service"
+    echo "🛑 停止并禁用 flux-agent 服务..."; systemctl stop flux-agent 2>/dev/null; systemctl disable flux-agent 2>/dev/null; rm -f "/etc/systemd/system/flux-agent.service"
   fi
-  if [[ -f "$INSTALL_DIR/flux-agent" ]]; then
-    rm -f "$INSTALL_DIR/flux-agent"
-    echo "🧹 删除 flux-agent 二进制"
-  fi
-
-  # 删除安装目录
-  if [[ -d "$INSTALL_DIR" ]]; then
-    rm -rf "$INSTALL_DIR"
-    echo "🧹 删除安装目录: $INSTALL_DIR"
-  fi
-
-  # 重载 systemd
+  if [[ -f "$INSTALL_DIR/flux-agent" ]]; then rm -f "$INSTALL_DIR/flux-agent"; echo "🧹 删除 flux-agent 二进制"; fi
+  if [[ -d "$INSTALL_DIR" ]]; then rm -rf "$INSTALL_DIR"; echo "🧹 删除安装目录: $INSTALL_DIR"; fi
   systemctl daemon-reload
-
   echo "✅ 卸载完成"
 }
 
@@ -515,7 +597,7 @@ main() {
   # 显示交互式菜单
   while true; do
     show_menu
-    read -p "请输入选项 (1-5): " choice
+    read -p "请输入选项 (1-4): " choice
     
     case $choice in
       1)
@@ -534,11 +616,6 @@ main() {
         exit 0
         ;;
       4)
-        block_protocol
-        delete_self
-        exit 0
-        ;;
-      5)
         echo "👋 退出脚本"
         delete_self
         exit 0
