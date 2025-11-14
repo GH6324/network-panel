@@ -90,6 +90,7 @@ func RegisterRoutes(r *gin.Engine) {
 		node.POST("/sysinfo", controller.NodeSysinfo)
 		node.POST("/interfaces", controller.NodeInterfaces)
         node.POST("/ops", controller.NodeOps)
+        node.POST("/restart-gost", controller.NodeRestartGost)
 	}
 
 	// tunnel

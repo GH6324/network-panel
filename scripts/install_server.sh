@@ -132,10 +132,33 @@ extract_or_install() {
   local file="$1"
   mkdir -p "$INSTALL_DIR"
   if [[ "$file" =~ \.tar\.gz$|\.tgz$ ]]; then
-    tar -xzf "$file" -C "$INSTALL_DIR"
+    # Preserve existing files (especially SQLite DB) during extraction
+    if tar --help 2>/dev/null | grep -q -- '--keep-old-files'; then
+      tar --keep-old-files -xzf "$file" -C "$INSTALL_DIR"
+    else
+      # Fallback for non-GNU tar: extract to temp then copy without overwriting
+      local tmpdir
+      tmpdir=$(mktemp -d)
+      tar -xzf "$file" -C "$tmpdir"
+      if command -v rsync >/dev/null 2>&1; then
+        rsync -a --ignore-existing "$tmpdir"/ "$INSTALL_DIR"/
+      else
+        # cp -an to avoid overwriting; fallback loop if -n unsupported
+        if cp -an "$tmpdir"/* "$INSTALL_DIR"/ 2>/dev/null; then :; else
+          find "$tmpdir" -type f | while read -r f; do
+            rel="${f#${tmpdir}/}"
+            dest="$INSTALL_DIR/$rel"
+            mkdir -p "$(dirname "$dest")"
+            [[ -e "$dest" ]] || cp -a "$f" "$dest"
+          done
+        fi
+      fi
+      rm -rf "$tmpdir"
+    fi
   elif [[ "$file" =~ \.zip$ ]]; then
     if command -v unzip >/dev/null 2>&1; then
-      unzip -o "$file" -d "$INSTALL_DIR"
+      # -n: never overwrite existing files
+      unzip -n "$file" -d "$INSTALL_DIR"
     else
       log "unzip not found, please install unzip or provide a .tar.gz"
       return 1
@@ -203,24 +226,132 @@ read_env_val() {
   return 1
 }
 
+# Update or append a key=value pair in an env file
+upsert_env_val() {
+  local f="$1" k="$2" v="$3"
+  mkdir -p "$(dirname "$f")"
+  if [[ -f "$f" ]] && grep -qE "^${k}=" "$f"; then
+    sed -i -E "s|^${k}=.*|${k}=${v}|" "$f"
+  else
+    printf '%s\n' "${k}=${v}" >> "$f"
+  fi
+}
+
+# Check if a TCP port is in use using lsof/ss/netstat/nc
+port_in_use() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0 || return 1
+  elif command -v ss >/dev/null 2>&1; then
+    ss -lnt "sport = :$port" 2>/dev/null | awk 'NR>1{exit 0} END{exit 1}' && return 0 || return 1
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -lnt 2>/dev/null | awk -v p=":$port" '$4 ~ p{found=1} END{exit found?0:1}' && return 0 || return 1
+  else
+    # Fallback: try connecting locally; if connection succeeds, assume in use
+    nc -z localhost "$port" >/dev/null 2>&1 && return 0 || return 1
+  fi
+}
+
+# Suggest the closest N unused ports greater than the given port
+suggest_free_ports_above() {
+  local base="$1" count="${2:-10}" max_scan=10000
+  local p=$(( base + 1 ))
+  local found=0 out=()
+  while (( found < count && max_scan > 0 )); do
+    # stop if exceeding valid TCP port range
+    if (( p > 65535 )); then break; fi
+    if ! port_in_use "$p"; then
+      out+=("$p")
+      found=$((found+1))
+    fi
+    p=$((p+1))
+    max_scan=$((max_scan-1))
+  done
+  printf '%s\n' "${out[*]}"
+}
+
+# Ensure a usable port; if desired is busy, print 10 nearest higher free ports and pick the first
+ensure_port_available() {
+  local desired="$1"; local suggestions="" first=""
+  if port_in_use "$desired"; then
+    suggestions=$(suggest_free_ports_above "$desired" 10)
+    log "Port $desired is in use. Suggested free ports (nearest higher): ${suggestions}"
+    first=$(printf '%s' "$suggestions" | awk '{print $1}')
+    if [[ -n "$first" ]]; then
+      printf '%s\n' "$first"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$desired"
+}
+
 # Clean the installation directory while preserving SQLite DB if configured
 clean_install_dir_preserve_sqlite() {
   mkdir -p "$INSTALL_DIR"
-  local dialect="" dbpath=""
+  local dialect="" dbpath_config="" default_db="${INSTALL_DIR}/panel.db"
+
+  # Try to read configured dialect and sqlite path
   dialect=$(read_env_val "$ENV_FILE" DB_DIALECT || true)
   if [[ -z "$dialect" ]]; then
     dialect=$(read_env_val "$DOT_ENV_FILE" DB_DIALECT || true)
   fi
-  if [[ "$dialect" == "sqlite" ]]; then
-    dbpath=$(read_env_val "$ENV_FILE" DB_SQLITE_PATH || true)
-    if [[ -z "$dbpath" ]]; then
-      dbpath=$(read_env_val "$DOT_ENV_FILE" DB_SQLITE_PATH || true)
-    fi
-    if [[ -z "$dbpath" ]]; then dbpath="${INSTALL_DIR}/panel.db"; fi
+  dbpath_config=$(read_env_val "$ENV_FILE" DB_SQLITE_PATH || true)
+  if [[ -z "$dbpath_config" ]]; then
+    dbpath_config=$(read_env_val "$DOT_ENV_FILE" DB_SQLITE_PATH || true)
   fi
-  if [[ -n "$dbpath" && -f "$dbpath" ]]; then
-    log "Cleaning $INSTALL_DIR (preserve sqlite DB: $dbpath)"
-    find "$INSTALL_DIR" -mindepth 1 ! -samefile "$dbpath" -exec rm -rf {} + 2>/dev/null || true
+
+  # Build list of paths to preserve:
+  #  - If a sqlite path is configured and exists
+  #  - Always also preserve default ${INSTALL_DIR}/panel.db if it exists, even when dialect isn't sqlite
+  local preserve_paths=()
+  if [[ -n "$dbpath_config" && -f "$dbpath_config" ]]; then
+    preserve_paths+=("$dbpath_config")
+  fi
+  if [[ -f "$default_db" ]]; then
+    # Avoid duplicate entries if it matches dbpath_config
+    if [[ "${dbpath_config:-}" != "$default_db" ]]; then
+      preserve_paths+=("$default_db")
+    else
+      preserve_paths+=("$default_db")
+    fi
+  fi
+
+  if (( ${#preserve_paths[@]} > 0 )); then
+    log "Cleaning $INSTALL_DIR (preserving sqlite DB files: ${preserve_paths[*]})"
+    # Move out any DBs that are inside INSTALL_DIR, wipe, and move back.
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    # Track mapping of original path to temp path
+    local i p rel tdest
+    for ((i=0; i<${#preserve_paths[@]}; i++)); do
+      p="${preserve_paths[$i]}"
+      # Only need to move if it's inside INSTALL_DIR; if outside, cleaning won't affect it.
+      case "$p" in
+        "$INSTALL_DIR"/*)
+          rel="${p#${INSTALL_DIR}/}"
+          tdest="$tmpdir/$rel"
+          mkdir -p "$(dirname "$tdest")" 2>/dev/null || true
+          cp -a "$p" "$tdest" 2>/dev/null || true
+          ;;
+      esac
+    done
+    # Now wipe installation directory fully
+    rm -rf "${INSTALL_DIR}/"* 2>/dev/null || true
+    # Restore preserved files back
+    for ((i=0; i<${#preserve_paths[@]}; i++)); do
+      p="${preserve_paths[$i]}"
+      case "$p" in
+        "$INSTALL_DIR"/*)
+          rel="${p#${INSTALL_DIR}/}"
+          tdest="$tmpdir/$rel"
+          if [[ -f "$tdest" ]]; then
+            mkdir -p "$(dirname "$p")" 2>/dev/null || true
+            mv -f "$tdest" "$p" 2>/dev/null || cp -a "$tdest" "$p" 2>/dev/null || true
+          fi
+          ;;
+      esac
+    done
+    rm -rf "$tmpdir" 2>/dev/null || true
   else
     log "Cleaning $INSTALL_DIR (no sqlite DB to preserve)"
     rm -rf "${INSTALL_DIR}/"* 2>/dev/null || true
@@ -363,7 +494,7 @@ write_env_file() {
   cat > "$ENV_FILE" <<EOF
 # Flux Panel server environment
 # Bind port for HTTP API
-PORT=6365
+PORT=${PORT_CHOSEN:-6365}
 # Database settings
 # Default to SQLite for simpler out-of-the-box usage. To switch to MySQL,
 # clear DB_DIALECT and set DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD.
@@ -509,6 +640,19 @@ main() {
   # Ensure installation directory exists and preserve sqlite DB if needed
   mkdir -p "$INSTALL_DIR"
   clean_install_dir_preserve_sqlite
+  # Determine desired port and ensure it is available (or suggest nearest alternatives)
+  local desired_port
+  desired_port=$(read_env_val "$ENV_FILE" PORT || true)
+  if [[ -z "$desired_port" ]]; then desired_port=$(read_env_val "$DOT_ENV_FILE" PORT || true); fi
+  if [[ -z "$desired_port" ]]; then desired_port=6365; fi
+  PORT_CHOSEN=$(ensure_port_available "$desired_port")
+  if [[ "$PORT_CHOSEN" != "$desired_port" ]]; then
+    # If env files already exist, update them in-place; otherwise write_env_file will write defaults with PORT_CHOSEN
+    if [[ -f "$ENV_FILE" || -f "$DOT_ENV_FILE" ]]; then
+      upsert_env_val "$ENV_FILE" PORT "$PORT_CHOSEN"
+      upsert_env_val "$DOT_ENV_FILE" PORT "$PORT_CHOSEN"
+    fi
+  fi
   log "Downloading prebuilt server binary..."
   local file
   if file=$(download_prebuilt "$arch"); then
@@ -523,7 +667,7 @@ main() {
   write_env_file
   if [[ ! -f "$DOT_ENV_FILE" ]]; then
     cat > "$DOT_ENV_FILE" <<EOF
-PORT=6365
+PORT=${PORT_CHOSEN:-6365}
 DB_DIALECT=sqlite
 DB_SQLITE_PATH=${INSTALL_DIR}/panel.db
 DB_HOST=127.0.0.1

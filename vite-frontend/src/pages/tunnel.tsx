@@ -356,15 +356,17 @@ export default function TunnelPage() {
               tid = candidates.length>0 ? candidates.sort((a,b)=> (b.id||0)-(a.id||0))[0].id : undefined;
             }
           }
-          if (form.type===2 && tid) {
+          if (tid) {
             if (midPath.length>0) await setTunnelPath(tid as number, midPath);
+            // 出站接口IP（入口及中间）
             const ifaces: Array<{nodeId:number, ip:string}> = [];
             if (form.inNodeId) ifaces.push({ nodeId: form.inNodeId, ip: entryIface||'' });
             midPath.forEach(nid=>{ ifaces.push({ nodeId: nid, ip: midIfaces[nid]||'' }); });
             if (ifaces.length>0) await setTunnelIface(tid as number, ifaces);
+            // 入站绑定IP（中间与出口）——仅隧道转发需要出口绑定，端口转发忽略出口
             const binds: Array<{nodeId:number, ip:string}> = [];
             midPath.forEach(nid=>{ binds.push({ nodeId: nid, ip: (midBindIps[nid]||'') }); });
-            if (form.outNodeId) binds.push({ nodeId: form.outNodeId, ip: (exitBindIp||'') });
+            if (form.type===2 && form.outNodeId) binds.push({ nodeId: form.outNodeId, ip: (exitBindIp||'') });
             if (binds.length>0) await setTunnelBind(tid as number, binds);
           }
         } catch {}
@@ -915,14 +917,14 @@ export default function TunnelPage() {
                       />
                     </div>
 
-                    {/* 多级路径（中间节点，按顺序，仅隧道转发） */}
-                    {form.type === 2 && (
+                    {/* 多级路径（中间节点，按顺序，端口转发与隧道转发均支持） */}
+                    {true && (
                       <div className="mt-2">
                         <h3 className="text-base font-semibold mb-1">多级路径</h3>
                         {/* 入口接口选择 */}
                         <div className="mb-2 text-sm">
                           <div className="flex items-center gap-2">
-                            <span className="text-default-600">入口出口IP</span>
+                            <span className="text-default-600">入口出站IP(接口)</span>
                             <Select
                               size="sm"
                               className="min-w-[320px] max-w-[380px]"
@@ -1009,7 +1011,7 @@ export default function TunnelPage() {
                             })}
                           </div>
                         )}
-                        <div className="text-2xs text-default-400 mt-1">说明：仅对“隧道转发”生效。入口→中间节点→出口（gRPC）依次直转。</div>
+                        <div className="text-2xs text-default-400 mt-1">说明：入口→中间节点→出口 逐级直转；端口转发和隧道转发均可配置路径和每节点出站/入站IP。</div>
                       </div>
                     )}
 

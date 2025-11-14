@@ -232,6 +232,34 @@ func NodeOps(c *gin.Context) {
     c.JSON(http.StatusOK, response.Ok(map[string]any{"ops": list}))
 }
 
+// POST /api/v1/node/restart-gost {nodeId}
+// Ask agent to restart gost service and wait for result if supported.
+func NodeRestartGost(c *gin.Context) {
+    var p struct{ NodeID int64 `json:"nodeId"` }
+    if err := c.ShouldBindJSON(&p); err != nil { c.JSON(http.StatusOK, response.ErrMsg("参数错误")); return }
+    if p.NodeID <= 0 { c.JSON(http.StatusOK, response.ErrMsg("参数错误")); return }
+    // ensure node exists
+    var n model.Node
+    if err := dbpkg.DB.First(&n, p.NodeID).Error; err != nil { c.JSON(http.StatusOK, response.ErrMsg("节点不存在")); return }
+    // Prefer RestartService with name=gost to get explicit success/failure
+    req := map[string]interface{}{"requestId": RandUUID(), "name": "gost"}
+    if res, ok := RequestOp(p.NodeID, "RestartService", req, 8*time.Second); ok {
+        // parse result
+        data, _ := res["data"].(map[string]interface{})
+        succ := false
+        msg := ""
+        if data != nil {
+            if v, ok := data["success"].(bool); ok { succ = v }
+            if v, ok := data["message"].(string); ok { msg = v }
+        }
+        c.JSON(http.StatusOK, response.Ok(map[string]any{"success": succ, "message": msg}))
+        return
+    }
+    // Fallback: fire-and-forget old command; return timeout message
+    _ = sendWSCommand(p.NodeID, "RestartGost", map[string]any{"reason": "manual_from_ui"})
+    c.JSON(http.StatusOK, response.Ok(map[string]any{"success": false, "message": "agent未回执，已下发重启命令"}))
+}
+
 // utils (local)
 func wrapIPv6(hostport string) string {
 	// naive: if value contains ':' more than once and not wrapped, wrap host

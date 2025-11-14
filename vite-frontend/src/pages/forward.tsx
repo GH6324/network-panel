@@ -5,7 +5,6 @@ import { Input } from "@heroui/input";
 import { Textarea } from "@heroui/input";
 import { Select, SelectItem } from "@heroui/select";
 import { Modal, ModalContent, ModalHeader, ModalBody, ModalFooter } from "@heroui/modal";
-import { Divider } from "@heroui/divider";
 import { Chip } from "@heroui/chip";
 import { Spinner } from "@heroui/spinner";
 import { Switch } from "@heroui/switch";
@@ -44,12 +43,14 @@ import {
   pauseForwardService,
   resumeForwardService,
   diagnoseForwardStep,
+  diagnoseForward,
   updateForwardOrder,
   getNodeInterfaces,
-  getTunnelById,
   getTunnelPath,
   getTunnelBind,
-  setTunnelBind,
+  getTunnelIface,
+  getNodeList,
+  getTunnelList,
 } from "@/api";
 import { JwtUtil } from "@/utils/jwt";
 
@@ -78,6 +79,10 @@ interface Tunnel {
   name: string;
   inNodePortSta?: number;
   inNodePortEnd?: number;
+  // 以下字段用于只读预览/选择接口IP（若后端未返回则保持为可选）
+  type?: number; // 1: 端口转发, 2: 隧道转发
+  inNodeId?: number;
+  outNodeId?: number;
 }
 
 interface ForwardForm {
@@ -196,6 +201,7 @@ export default function ForwardPage() {
   }>>([]);
   const [opsOpen, setOpsOpen] = useState(false);
   const [opReqId, setOpReqId] = useState<string>('');
+  const [restartingNodeId, setRestartingNodeId] = useState<number | null>(null);
   
   // 表单状态
   const [form, setForm] = useState<ForwardForm>({
@@ -211,48 +217,38 @@ export default function ForwardPage() {
   // 表单验证错误
   const [errors, setErrors] = useState<{[key: string]: string}>({});
   const [selectedTunnel, setSelectedTunnel] = useState<Tunnel | null>(null);
-  // 监听IP（入站）配置（仅隧道转发）
-  const [midPath, setMidPath] = useState<number[]>([]);
-  const [midBindIps, setMidBindIps] = useState<Record<number,string>>({});
-  const [exitBindIp, setExitBindIp] = useState<string>('');
-  const [ifaceCache, setIfaceCache] = useState<Record<number,string[]>>({});
+  // 路径与每节点 IP 仅在“隧道管理”维护；此页提供只读预览
+  const [previewType, setPreviewType] = useState<number|undefined>(undefined);
+  const [previewInNodeId, setPreviewInNodeId] = useState<number|undefined>(undefined);
+  const [previewOutNodeId, setPreviewOutNodeId] = useState<number|undefined>(undefined);
+  const [previewPath, setPreviewPath] = useState<number[]>([]);
+  const [previewBind, setPreviewBind] = useState<Record<number,string>>({});
+  const [previewIface, setPreviewIface] = useState<Record<number,string>>({});
+  const [previewExitBind, setPreviewExitBind] = useState<string>("");
+  const [nodeNameMap, setNodeNameMap] = useState<Record<number,string>>({});
+  const [previewTunnelMap, setPreviewTunnelMap] = useState<Record<number, any>>({});
 
-  const fetchNodeIfaces = async (nodeId:number) => {
-    if (!nodeId) return [] as string[];
-    if (ifaceCache[nodeId]) return ifaceCache[nodeId];
-    try{
-      const r:any = await getNodeInterfaces(nodeId);
-      const ips = (r.code===0 && Array.isArray(r.data?.ips)) ? r.data.ips as string[] : [];
-      setIfaceCache(prev=>({...prev, [nodeId]: ips}));
-      return ips;
-    }catch{ return [] }
-  };
-
-  useEffect(() => {
-    loadData();
-  }, []);
+  useEffect(() => { loadData(); }, []);
   
-  function ForwardIfacePicker({ selectedTunnel, onSelect }: { selectedTunnel: Tunnel | null; onSelect:(ip:string)=>void }){
+  function ForwardIfacePicker({ selectedTunnel, onSelect, active }: { selectedTunnel: Tunnel | null; onSelect:(ip:string)=>void; active:boolean }){
     const [ips, setIps] = useState<string[]>([]);
-    const [loading, setLoading] = useState(false);
+    const [fetchedTunnelId, setFetchedTunnelId] = useState<number | null>(null);
     useEffect(()=>{
       const load = async ()=>{
-        setIps([]); setLoading(true);
+        const t = selectedTunnel;
+        if (!active || !t || !t.id) return;
+        if (fetchedTunnelId === t.id && ips.length > 0) return; // 已加载且同一隧道，避免重复刷新
         try {
-          const t = selectedTunnel;
-          if (!t) { setLoading(false); return; }
-          const dt:any = await getTunnelById(t.id);
-          if (dt.code !== 0 || !dt.data) { setLoading(false); return; }
-          const type = dt.data.type;
-          const nodeId = (type === 2 && dt.data.outNodeId) ? dt.data.outNodeId : dt.data.inNodeId;
-          if (!nodeId) { setLoading(false); return; }
+          const type = t.type ?? 1;
+          const nodeId = (type === 2 && t.outNodeId) ? t.outNodeId : t.inNodeId;
+          if (!nodeId) { return; }
           const res:any = await getNodeInterfaces(Number(nodeId));
           if (res.code===0 && Array.isArray(res.data?.ips)) setIps(res.data.ips as string[]);
-        } catch { /* noop */ } finally { setLoading(false); }
+          setFetchedTunnelId(t.id);
+        } catch { /* noop */ } finally { /* no-op */ }
       };
       load();
-    }, [selectedTunnel?.id]);
-    if (loading) return <div className="text-xs text-default-500">加载接口IP...</div>;
+    }, [active, selectedTunnel?.id, selectedTunnel?.type, selectedTunnel?.outNodeId, selectedTunnel?.inNodeId]);
     return (
       <Select
         label="出口IP"
@@ -331,9 +327,10 @@ export default function ForwardPage() {
   const loadData = async (lod = true) => {
     setLoading(lod);
     try {
-      const [forwardsRes, tunnelsRes] = await Promise.all([
+      const [forwardsRes, tunnelsRes, allTunnelsRes] = await Promise.all([
         getForwardList(),
-        userTunnel()
+        userTunnel(),
+        getTunnelList().catch(()=>({code:-1}))
       ]);
       
       if (forwardsRes.code === 0) {
@@ -401,6 +398,18 @@ export default function ForwardPage() {
         setTunnels(tunnelsRes.data || []);
       } else {
         console.warn('获取隧道列表失败:', tunnelsRes.msg);
+      }
+      // 预览用的完整隧道信息（包含 type/inNodeId/outNodeId）
+      {
+        const resp:any = allTunnelsRes as any;
+        const arr:any[] = (resp && resp.code === 0 && Array.isArray(resp.data)) ? resp.data as any[] : [];
+        if (arr.length > 0) {
+          const map:Record<number, any> = {};
+          arr.forEach(t=>{ if(t?.id) map[Number(t.id)] = t; });
+          setPreviewTunnelMap(map);
+        } else {
+          setPreviewTunnelMap({});
+        }
       }
     } catch (error) {
       console.error('加载数据失败:', error);
@@ -579,28 +588,47 @@ export default function ForwardPage() {
     const tunnel = tunnels.find(t => t.id === parseInt(tunnelId));
     setSelectedTunnel(tunnel || null);
     setForm(prev => ({ ...prev, tunnelId: parseInt(tunnelId) }));
-    // 加载多级路径与已保存监听IP（仅隧道转发）
+    // 只读预览：读取该隧道的路径与每节点 IP 设置
     (async()=>{
       try{
-        if (tunnel && (tunnel as any).type === 2){
-          const rp:any = await getTunnelPath(tunnel.id);
-          const path:number[] = (rp.code===0 && Array.isArray(rp.data?.path)) ? rp.data.path as number[] : [];
-          setMidPath(path);
-          const rb:any = await getTunnelBind(tunnel.id);
-          const bindMap:Record<number,string> = {};
-          if (rb.code===0 && Array.isArray(rb.data?.binds)){
-            rb.data.binds.forEach((x:any)=>{ if(x?.nodeId) bindMap[Number(x.nodeId)] = String(x.ip||''); });
-          }
-          setMidBindIps(bindMap);
-          if ((tunnel as any).outNodeId && bindMap[(tunnel as any).outNodeId]) setExitBindIp(bindMap[(tunnel as any).outNodeId]); else setExitBindIp('');
-          // 预取接口IP
-          if ((tunnel as any).outNodeId) await fetchNodeIfaces((tunnel as any).outNodeId);
-          for (const nid of path){ await fetchNodeIfaces(nid); }
+        const tidNum = parseInt(tunnelId);
+        const tInfo = previewTunnelMap[tidNum];
+        if (tInfo){
+          setPreviewType(tInfo.type);
+          setPreviewInNodeId(tInfo.inNodeId);
+          setPreviewOutNodeId(tInfo.outNodeId||undefined);
         } else {
-          setMidPath([]); setMidBindIps({}); setExitBindIp('');
+          setPreviewType(undefined); setPreviewInNodeId(undefined); setPreviewOutNodeId(undefined);
         }
+      }catch{ setPreviewType(undefined); setPreviewInNodeId(undefined); setPreviewOutNodeId(undefined); }
+      try{
+        const [rp, rb, ri, nl] = await Promise.all([
+          getTunnelPath(parseInt(tunnelId)),
+          getTunnelBind(parseInt(tunnelId)),
+          getTunnelIface(parseInt(tunnelId)),
+          getNodeList(),
+        ]);
+        if (rp.code===0 && Array.isArray(rp.data?.path)) setPreviewPath(rp.data.path as number[]); else setPreviewPath([]);
+        const bMap:Record<number,string> = {};
+        if (rb.code===0 && Array.isArray(rb.data?.binds)){
+          rb.data.binds.forEach((x:any)=>{ if(x?.nodeId) bMap[Number(x.nodeId)] = String(x.ip||''); });
+        }
+        setPreviewBind(bMap);
+        const iMap:Record<number,string> = {};
+        if (ri.code===0 && Array.isArray(ri.data?.ifaces)){
+          ri.data.ifaces.forEach((x:any)=>{ if(x?.nodeId) iMap[Number(x.nodeId)] = String(x.ip||''); });
+        }
+        setPreviewIface(iMap);
+        // 出口监听IP（仅隧道转发）
+        const outId = (previewTunnelMap[parseInt(tunnelId)]?.outNodeId) || undefined;
+        if (outId && bMap[outId]) setPreviewExitBind(bMap[outId]); else setPreviewExitBind("");
+        const nMap:Record<number,string> = {};
+        if (nl.code===0 && Array.isArray(nl.data)){
+          (nl.data as any[]).forEach(n=>{ nMap[Number(n.id)] = String(n.name||('节点'+n.id)); });
+        }
+        setNodeNameMap(nMap);
       }catch{
-        setMidPath([]); setMidBindIps({}); setExitBindIp('');
+        setPreviewPath([]); setPreviewBind({}); setPreviewIface({}); setPreviewExitBind(""); setNodeNameMap({});
       }
     })();
   };
@@ -620,6 +648,7 @@ export default function ForwardPage() {
       const addressCount = processedRemoteAddr.split(',').length;
       
       let res;
+      // 不在此页保存路径与每节点 IP；请在“隧道管理”维护
       if (isEdit) {
         // 更新时确保包含必要字段
         const updateData = {
@@ -664,16 +693,7 @@ export default function ForwardPage() {
             ), { duration: 5000 });
           }
         }catch{}
-        // 保存监听IP映射（仅隧道转发）
-        try{
-          const tid = (selectedTunnel && (selectedTunnel as any).type===2) ? (selectedTunnel.id) : 0;
-          if (tid) {
-            const binds: Array<{nodeId:number, ip:string}> = [];
-            midPath.forEach(nid=>{ binds.push({ nodeId: nid, ip: midBindIps[nid]||'' }); });
-            if ((selectedTunnel as any).outNodeId) binds.push({ nodeId: (selectedTunnel as any).outNodeId, ip: exitBindIp||'' });
-            if (binds.length>0) await setTunnelBind(tid, binds);
-          }
-        }catch{}
+        // 无需再次保存路径与IP映射（创建前已保存）
         setModalOpen(false);
         loadData();
       } else {
@@ -761,6 +781,16 @@ export default function ForwardPage() {
       } else {
         append({ success: false, description: '路径连通性', nodeName: '-', nodeId: '-', targetIp: '-', message: rPath.msg || '失败' });
       }
+
+      // 2) 节点服务清单（逐跳）：从 /forward/diagnose 抽取“节点服务清单”一项，用于展示各节点的服务配置与状态
+      try {
+        const rFull = await diagnoseForward(forward.id);
+        if (rFull && rFull.code === 0) {
+          const list = Array.isArray(rFull.data?.results) ? rFull.data.results : (Array.isArray(rFull.data) ? rFull.data : []);
+          const hopItem = (list as any[]).find((it:any) => it && (it.description === '节点服务清单' || Array.isArray(it.hops)));
+          if (hopItem) append(hopItem);
+        }
+      } catch {}
       // 3) iperf3 反向带宽（仅隧道转发）
       //const r3 = await diagnoseForwardStep(forward.id, 'iperf3');
      // if (r3.code === 0) append(r3.data); else append({ success: false, description: 'iperf3 反向带宽测试', nodeName: '-', nodeId: '-', targetIp: '-', message: r3.msg || '未支持或失败' });
@@ -768,6 +798,103 @@ export default function ForwardPage() {
       toast.error('诊断失败');
     } finally {
       setDiagnosisLoading(false);
+    }
+  };
+
+  const handleRestartGost = async (nodeId: number) => {
+    if (!nodeId) return;
+    try {
+      setRestartingNodeId(nodeId);
+      const api = await import('@/api');
+      const res:any = await api.restartGost(nodeId);
+      if (res.code === 0) {
+        const ok = !!(res.data && res.data.success);
+        const msg = (res.data && res.data.message) ? res.data.message : (ok ? '重启成功' : '重启已下发');
+        if (ok) toast.success(msg); else toast.success(msg);
+        // 若重启成功或已下发，针对当前节点：
+        // 1) 重新刷新该节点的服务清单（监听状态等）
+        if (currentDiagnosisForward) {
+          try {
+            const rFull:any = await api.diagnoseForward(currentDiagnosisForward.id);
+            if (rFull && rFull.code === 0) {
+              const list = Array.isArray(rFull.data?.results) ? rFull.data.results : (Array.isArray(rFull.data) ? rFull.data : []);
+              const hopItem = (list as any[]).find((it:any) => it && (it.description === '节点服务清单' || Array.isArray(it.hops)));
+              if (hopItem && Array.isArray(hopItem.hops)) {
+                setDiagnosisResult(prev => {
+                  if (!prev) return prev;
+                  const newResults = prev.results.map((it:any) => {
+                    if (Array.isArray(it.hops)) {
+                      const newHops = it.hops.map((h:any) => h && h.nodeId === nodeId ? ({ ...h, services: (hopItem.hops.find((nh:any)=>nh.nodeId===nodeId)?.services || h.services) }) : h);
+                      return { ...it, hops: newHops };
+                    }
+                    return it;
+                  });
+                  return { ...prev, results: newResults } as any;
+                });
+              }
+            }
+          } catch {}
+          // 2) 仅重新运行“逐跳连通性 (ICMP)”等与该节点相关的路径诊断，并合并该节点对应项
+          try {
+            const rPath:any = await api.diagnoseForwardStep(currentDiagnosisForward.id, 'path');
+            if (rPath && rPath.code === 0) {
+              const items:any[] = Array.isArray(rPath.data?.results) ? rPath.data.results : [];
+              const replaceForNode = items.filter(x => x && Number(x.nodeId) === Number(nodeId));
+              if (replaceForNode.length > 0) {
+                setDiagnosisResult(prev => {
+                  if (!prev) return prev;
+                  const newResults = prev.results.map((it:any) => {
+                    // 仅替换“逐跳连通性 (ICMP)”或同类分项中的该节点记录
+                    if (typeof it?.description === 'string' && it.description.indexOf('逐跳连通性') >= 0) {
+                      // 在 path 结果中找同 nodeId 的新项
+                      const fresh = replaceForNode.find(n => Number(n.nodeId) === Number(nodeId));
+                      return fresh ? fresh : it;
+                    }
+                    return it;
+                  });
+                  return { ...prev, results: newResults } as any;
+                });
+              }
+            }
+          } catch {}
+          // 3) 轮询几次（短间隔）以等待 gost 完全启动后端口监听再更新（最多3次）
+          const sleep = (ms:number)=> new Promise(res=>setTimeout(res, ms));
+          for (let i=0;i<3;i++){
+            await sleep(1000);
+            try{
+              const rFull2:any = await api.diagnoseForward(currentDiagnosisForward.id);
+              if (rFull2 && rFull2.code===0){
+                const list2 = Array.isArray(rFull2.data?.results) ? rFull2.data.results : (Array.isArray(rFull2.data) ? rFull2.data : []);
+                const hopItem2 = (list2 as any[]).find((it:any) => it && (it.description === '节点服务清单' || Array.isArray(it.hops)));
+                if (hopItem2 && Array.isArray(hopItem2.hops)){
+                  const targetHop = (hopItem2.hops as any[]).find((h:any)=> h && Number(h.nodeId)===Number(nodeId));
+                  if (targetHop){
+                    setDiagnosisResult(prev => {
+                      if (!prev) return prev;
+                      const newResults = prev.results.map((it:any) => {
+                        if (Array.isArray(it.hops)){
+                          const newHops = it.hops.map((h:any)=> h && h.nodeId===nodeId ? ({...h, services: targetHop.services}) : h);
+                          return { ...it, hops: newHops };
+                        }
+                        return it;
+                      });
+                      return { ...prev, results: newResults } as any;
+                    });
+                    // 若任一服务已监听，提前结束轮询
+                    if (Array.isArray(targetHop.services) && targetHop.services.some((s:any)=> !!s?.listening)) break;
+                  }
+                }
+              }
+            }catch{}
+          }
+        }
+      } else {
+        toast.error(res.msg || '重启失败');
+      }
+    } catch (e:any) {
+      toast.error('重启失败');
+    } finally {
+      setRestartingNodeId(null);
     }
   };
 
@@ -1650,9 +1777,9 @@ export default function ForwardPage() {
           isOpen={modalOpen}
           onOpenChange={setModalOpen}
           size="2xl"
-          scrollBehavior="outside"
+          scrollBehavior="inside"
           backdrop="blur"
-          placement="center"
+          placement="top-center"
         >
           <ModalContent>
             {(onClose) => (
@@ -1730,46 +1857,57 @@ export default function ForwardPage() {
                       maxRows={6}
                     />
                     
-                    <ForwardIfacePicker selectedTunnel={selectedTunnel} onSelect={(ip)=>setForm(prev=>({...prev, interfaceName: ip}))} />
+                    <ForwardIfacePicker active={modalOpen} selectedTunnel={selectedTunnel} onSelect={(ip)=>setForm(prev=>({...prev, interfaceName: ip}))} />
 
-                    {selectedTunnel && (selectedTunnel as any).type===2 && (
-                      <div className="space-y-3">
-                        <Divider />
-                        <h3 className="text-base font-semibold">监听IP（仅隧道转发）</h3>
-                        {(selectedTunnel as any).outNodeId && (
-                          <Select
-                            label="出口监听IP"
-                            placeholder="请选择出口监听IP"
-                            className="min-w-[320px] max-w-[380px]"
-                            selectedKeys={exitBindIp ? [exitBindIp] : []}
-                            onOpenChange={async()=>{ await fetchNodeIfaces((selectedTunnel as any).outNodeId); }}
-                            onSelectionChange={(keys)=>{ const k = Array.from(keys)[0] as string; setExitBindIp(k||''); }}
-                            variant="bordered"
-                          >
-                            {(ifaceCache[(selectedTunnel as any).outNodeId]||[]).map(ip=> (<SelectItem key={ip}>{ip}</SelectItem>))}
-                          </Select>
-                        )}
-                        {midPath.length>0 && (
-                          <div className="space-y-2">
-                            {midPath.map(nid => (
-                              <div key={nid} className="flex items-center gap-2 text-sm">
-                                <div className="w-24 text-default-600">节点 {nid}</div>
-                                <Select
-                                  aria-label="选择监听IP(入站)"
-                                  size="sm"
-                                  className="min-w-[320px] max-w-[380px]"
-                                  selectedKeys={midBindIps[nid]? [midBindIps[nid]]: []}
-                                  onOpenChange={async()=>{ await fetchNodeIfaces(nid); }}
-                                  onSelectionChange={(keys)=>{ const k = Array.from(keys)[0] as string; setMidBindIps(prev=>({...prev, [nid]: k||''})); }}
-                                >
-                                  {(ifaceCache[nid]||[]).map(ip=> (<SelectItem key={ip}>{ip}</SelectItem>))}
-                                </Select>
+                    {/* 只读预览：当前隧道的多级路径与每节点 IP 设置（在“隧道管理”维护） */}
+                    {selectedTunnel && (
+                      <Card className="border border-default-200">
+                        <CardHeader>
+                          <div className="font-semibold">隧道多级路径（只读）</div>
+                        </CardHeader>
+                        <CardBody>
+                          {previewInNodeId ? (
+                            <div className="space-y-2 text-sm">
+                              <div>
+                                <span className="text-default-600">入口</span>：
+                                <code className="ml-1">{nodeNameMap[previewInNodeId]||`#${previewInNodeId}`}</code>
+                                {previewIface[previewInNodeId] && (
+                                  <span className="ml-2 text-default-500">出站IP: <code>{previewIface[previewInNodeId]}</code></span>
+                                )}
                               </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
+                              {previewPath.length>0 ? previewPath.map((nid, idx)=> (
+                                <div key={nid} className="pl-4">
+                                  <span className="text-default-600">中继{idx+1}</span>：
+                                  <code className="ml-1">{nodeNameMap[nid]||`#${nid}`}</code>
+                                  {previewBind[nid] && (
+                                    <span className="ml-2 text-default-500">监听IP: <code>{previewBind[nid]}</code></span>
+                                  )}
+                                  {previewIface[nid] && (
+                                    <span className="ml-2 text-default-500">出站IP: <code>{previewIface[nid]}</code></span>
+                                  )}
+                                </div>
+                              )) : (
+                                <div className="pl-4 text-default-400">未配置中继节点</div>
+                              )}
+                              {(previewType===2 && previewOutNodeId) ? (
+                                <div className="pl-4">
+                                  <span className="text-default-600">出口</span>：
+                                  <code className="ml-1">{nodeNameMap[previewOutNodeId]||`#${previewOutNodeId}`}</code>
+                                  {previewExitBind && (
+                                    <span className="ml-2 text-default-500">监听IP: <code>{previewExitBind}</code></span>
+                                  )}
+                                </div>
+                              ) : null}
+                              <div className="text-2xs text-default-400 mt-1">说明：路径与节点 IP 请在“隧道管理”页维护。</div>
+                            </div>
+                          ) : (
+                            <div className="text-default-400 text-sm">未加载到隧道信息</div>
+                          )}
+                        </CardBody>
+                      </Card>
                     )}
+
+                    {/* 多级路径与每节点 IP 请在“隧道管理”页配置，这里不再编辑 */}
                     
                     {getAddressCount(form.remoteAddr) > 1 && (
                       <Select
@@ -2186,7 +2324,7 @@ export default function ForwardPage() {
                     </div>
                   ) : diagnosisResult ? (
                     <div className="space-y-4">
-                      {diagnosisResult.results.map((result, index) => {
+                      {diagnosisResult.results.map((result: any, index: number) => {
                         const quality = getQualityDisplay(result.averageTime, result.packetLoss);
                         
                         return (
@@ -2210,7 +2348,52 @@ export default function ForwardPage() {
                             </CardHeader>
                             
                             <CardBody className="pt-0">
-                              {result.success ? (
+                              {/* 特殊渲染：节点服务清单（逐跳） */}
+                              {Array.isArray(result.hops) ? (
+                                <div className="space-y-4">
+                                  {result.hops.map((hop: any, i: number) => (
+                                    <div key={i} className="border border-default-200 rounded-lg p-3">
+                                      <div className="flex items-center justify-between">
+                                        <div className="font-medium text-foreground">{hop.nodeName} <span className="text-default-500">({hop.role || '-'})</span></div>
+                                        <div className="text-small text-default-500">ID: {hop.nodeId}</div>
+                                      </div>
+                                      <div className="mt-3 space-y-2">
+                                        {Array.isArray(hop.services) && hop.services.length > 0 ? hop.services.map((svc: any, j: number) => (
+                                          <div key={j} className="rounded-md bg-content1 p-3 border border-default-200">
+                                            <div className="flex items-center justify-between gap-3">
+                                              <div className="font-mono text-sm truncate" title={svc.name}>{svc.name}</div>
+                                              <div className="flex items-center gap-2">
+                                                {svc.listener && <Chip size="sm" variant="flat" color="default">L:{svc.listener}</Chip>}
+                                                {svc.handler && <Chip size="sm" variant="flat" color="default">H:{svc.handler}</Chip>}
+                                                <Chip size="sm" variant="flat" color={svc.listening ? 'success' : 'danger'}>{svc.listening ? '监听中' : '未监听'}</Chip>
+                                                {typeof svc.inRange === 'boolean' && (
+                                                  <Chip size="sm" variant="flat" color={svc.inRange ? 'success' : 'warning'}>
+                                                    {svc.inRange ? '端口在范围内' : '超出范围'}{svc.range ? ` (${svc.range})` : ''}
+                                                  </Chip>
+                                                )}
+                                                {!svc.listening && (
+                                                  <Button size="sm" color="warning" variant="flat"
+                                                    isLoading={restartingNodeId === hop.nodeId}
+                                                    onPress={() => handleRestartGost(hop.nodeId)}
+                                                  >重启gost</Button>
+                                                )}
+                                              </div>
+                                            </div>
+                                            <div className="mt-2 text-small text-default-500 flex items-center gap-1">
+                                              <span>地址:</span>
+                                              <code className="font-mono truncate" title={svc.addr || ''}>{svc.addr || '-'}</code>
+                                              {svc.port ? <span className="ml-1">(端口 {svc.port})</span> : null}
+                                            </div>
+                                            {svc.message && <div className="mt-2 text-small text-danger-500">{svc.message}</div>}
+                                          </div>
+                                        )) : (
+                                          <div className="text-small text-default-400">未找到相关服务</div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : result.success ? (
                                 <div className="space-y-3">
                                   {(() => {
                                     const isIperf3 = typeof result.description === 'string' && result.description.toLowerCase().includes('iperf3');

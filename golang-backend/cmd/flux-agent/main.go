@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"debug/elf"
 	"github.com/gorilla/websocket"
 )
 
@@ -33,7 +34,7 @@ var (
 
 // versionBase is the agent semantic version (without role prefix).
 // final reported version is: go-agent-<versionBase> or go-agent2-<versionBase>
-var versionBase = "1.0.6.3"
+var versionBase = "1.0.6.7"
 var version = "" // computed in main()
 
 func isAgent2Binary() bool {
@@ -70,6 +71,12 @@ type Message struct {
 type Message2 struct {
 	Type string                 `json:"type"`
 	Data map[string]interface{} `json:"data"`
+}
+
+type SuggestPortsReq struct {
+	RequestID string `json:"requestId"`
+	Base      int    `json:"base"`
+	Count     int    `json:"count"`
 }
 
 func getenv(k, def string) string {
@@ -341,6 +348,14 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 			out := map[string]any{"type": "QueryServicesResult", "requestId": q.RequestID, "data": list}
 			_ = c.WriteJSON(out)
 			log.Printf("{\"event\":\"send_qs_result\",\"count\":%d}", len(list))
+		case "SuggestPorts":
+			var req SuggestPortsReq
+			_ = json.Unmarshal(m.Data, &req)
+			go func() {
+				ports := suggestPorts(req.Base, req.Count)
+				resp := map[string]any{"type": "SuggestPortsResult", "requestId": req.RequestID, "data": map[string]any{"ports": ports}}
+				_ = c.WriteJSON(resp)
+			}()
 		case "UpgradeAgent":
 			// optional payload: {to: "go-agent-1.x.y"}
 			go func() { _ = selfUpgrade(addr, scheme) }()
@@ -905,6 +920,109 @@ func portListening(port int) bool {
 	return false
 }
 
+// getUsedListeningPorts attempts to list TCP LISTEN ports via lsof/ss/netstat; fallback to probe
+func getUsedListeningPorts() map[int]bool {
+	used := map[int]bool{}
+	// Try lsof
+	if p, err := exec.LookPath("lsof"); err == nil {
+		cmd := exec.Command(p, "-nP", "-iTCP", "-sTCP:LISTEN")
+		cmd.Stdout = &bytes.Buffer{}
+		cmd.Stderr = &bytes.Buffer{}
+		if err := cmd.Run(); err == nil {
+			out := cmd.Stdout.(*bytes.Buffer).String()
+			lines := strings.Split(out, "\n")
+			for _, ln := range lines {
+				// typical line contains "*:8080 (LISTEN)" or "127.0.0.1:8080 (LISTEN)" or "[::]:8080"
+				if i := strings.LastIndex(ln, ":"); i >= 0 {
+					tail := ln[i+1:]
+					// tail may include space and (LISTEN)
+					fields := strings.Fields(tail)
+					if len(fields) > 0 {
+						if n, err2 := strconv.Atoi(fields[0]); err2 == nil {
+							used[n] = true
+						}
+					}
+				}
+			}
+			return used
+		}
+	}
+	// Try ss
+	if p, err := exec.LookPath("ss"); err == nil {
+		cmd := exec.Command(p, "-lnt")
+		cmd.Stdout = &bytes.Buffer{}
+		cmd.Stderr = &bytes.Buffer{}
+		if err := cmd.Run(); err == nil {
+			out := cmd.Stdout.(*bytes.Buffer).String()
+			lines := strings.Split(out, "\n")
+			for _, ln := range lines {
+				// lines like: LISTEN 0 128 0.0.0.0:22 ... or [::]:22
+				fields := strings.Fields(ln)
+				if len(fields) >= 4 {
+					addr := fields[3]
+					if i := strings.LastIndex(addr, ":"); i >= 0 && i+1 < len(addr) {
+						if n, err2 := strconv.Atoi(addr[i+1:]); err2 == nil {
+							used[n] = true
+						}
+					}
+				}
+			}
+			return used
+		}
+	}
+	// Try netstat
+	if p, err := exec.LookPath("netstat"); err == nil {
+		cmd := exec.Command(p, "-lnt")
+		cmd.Stdout = &bytes.Buffer{}
+		cmd.Stderr = &bytes.Buffer{}
+		if err := cmd.Run(); err == nil {
+			out := cmd.Stdout.(*bytes.Buffer).String()
+			lines := strings.Split(out, "\n")
+			for _, ln := range lines {
+				fields := strings.Fields(ln)
+				if len(fields) >= 4 {
+					addr := fields[len(fields)-2]
+					if i := strings.LastIndex(addr, ":"); i >= 0 && i+1 < len(addr) {
+						if n, err2 := strconv.Atoi(addr[i+1:]); err2 == nil {
+							used[n] = true
+						}
+					}
+				}
+			}
+			return used
+		}
+	}
+	// Fallback minimal: probe a small range around common ports
+	for _, p := range []int{22, 80, 443, 3306, 6379} {
+		if portListening(p) {
+			used[p] = true
+		}
+	}
+	return used
+}
+
+// suggestPorts returns up to count nearest higher free ports above base
+func suggestPorts(base, count int) []int {
+	if count <= 0 {
+		count = 10
+	}
+	if base < 0 {
+		base = 0
+	}
+	used := getUsedListeningPorts()
+	out := make([]int, 0, count)
+	p := base + 1
+	scanned := 0
+	for len(out) < count && p <= 65535 && scanned < 20000 {
+		if !used[p] && !portListening(p) {
+			out = append(out, p)
+		}
+		p++
+		scanned++
+	}
+	return out
+}
+
 // addOrUpdateServices merges provided services into gost.json services array.
 // If updateOnly is true, only update existing by name; otherwise upsert (add if missing).
 func addOrUpdateServices(services []map[string]any, updateOnly bool) error {
@@ -1303,11 +1421,16 @@ func selfUpgrade(addr, scheme string) error {
 	u := apiURL(scheme, addr, "/flux-agent/"+binName)
 	tmp := target + ".new"
 	log.Printf("{\"event\":\"agent_upgrade_begin\",\"url\":%q}", u)
-	if err := download(u, tmp); err != nil {
+	if err := downloadRetry(u, tmp, 3); err != nil {
 		log.Printf("upgrade download err: %v", err)
 		return err
 	}
-	_ = os.Rename(tmp, target)
+	if err := validateBinary(tmp, arch); err != nil {
+		log.Printf("upgrade validation err: %v", err)
+		_ = os.Remove(tmp)
+		return err
+	}
+	_ = safeReplace(target, tmp)
 	_ = os.Chmod(target, 0755)
 	// restart service or exec-replace
 	if tryRestartService(svc) {
@@ -1351,10 +1474,14 @@ func upgradeAgent1(addr, scheme, expected string) error {
 		}
 	}
 	tmp := target + ".new"
-	if err := download(u, tmp); err != nil {
+	if err := downloadRetry(u, tmp, 3); err != nil {
 		return err
 	}
-	_ = os.Rename(tmp, target)
+	if err := validateBinary(tmp, arch); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	_ = safeReplace(target, tmp)
 	_ = os.Chmod(target, 0755)
 	_ = os.WriteFile(verFile, []byte(expected), 0644)
 	// ensure service exists and start
@@ -1378,10 +1505,14 @@ func upgradeAgent2(addr, scheme, expected string) error {
 		}
 	}
 	tmp := target + ".new"
-	if err := download(u, tmp); err != nil {
+	if err := downloadRetry(u, tmp, 3); err != nil {
 		return err
 	}
-	_ = os.Rename(tmp, target)
+	if err := validateBinary(tmp, arch); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	_ = safeReplace(target, tmp)
 	_ = os.Chmod(target, 0755)
 	_ = os.WriteFile(verFile, []byte(expected), 0644)
 	ensureSystemdService("flux-agent2", target)
@@ -1559,6 +1690,75 @@ func download(url, dest string) error {
 	defer f.Close()
 	_, err = io.Copy(f, resp.Body)
 	return err
+}
+
+func downloadRetry(url, dest string, attempts int) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		err = download(url, dest)
+		if err == nil {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return err
+}
+
+// validateBinary performs a minimal ELF validation and arch check to avoid
+// accidentally writing HTML or truncated binaries during self-upgrade.
+func validateBinary(path string, arch string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	// A typical Go static binary > 1MB; reject obviously small files.
+	if fi.Size() < 1_000_000 {
+		return fmt.Errorf("binary too small: %d bytes", fi.Size())
+	}
+	// Parse ELF and validate machine
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// Use debug/elf
+	ef, err := elf.Open(path)
+	if err != nil {
+		return fmt.Errorf("not an ELF executable: %v", err)
+	}
+	defer ef.Close()
+	m := ef.FileHeader.Machine
+	switch arch {
+	case "amd64":
+		if m != elf.EM_X86_64 {
+			return fmt.Errorf("ELF machine mismatch: %v", m)
+		}
+	case "arm64":
+		if m != elf.EM_AARCH64 {
+			return fmt.Errorf("ELF machine mismatch: %v", m)
+		}
+	case "armv7":
+		if m != elf.EM_ARM {
+			return fmt.Errorf("ELF machine mismatch: %v", m)
+		}
+	}
+	return nil
+}
+
+func safeReplace(target, tmp string) error {
+	// backup existing
+	bak := target + ".bak"
+	_ = os.Remove(bak)
+	if _, err := os.Stat(target); err == nil {
+		_ = os.Rename(target, bak)
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		// try restore
+		_ = os.Rename(bak, target)
+		return err
+	}
+	_ = os.Remove(bak)
+	return nil
 }
 
 // --- self uninstall ---

@@ -202,6 +202,35 @@ connect_ws() {
           log "send DiagnoseResult tcp: $data_json"
           send_reply "$req_id" "$data_json" >&3
         fi
+      elif [[ "$typ" == "SuggestPorts" ]]; then
+        log "recv SuggestPorts: $line"
+        local req_id base count
+        req_id=$(printf '%s' "$line" | jq -r '.requestId // .data.requestId // ""')
+        base=$(printf '%s' "$line" | jq -r '.data.base // 0')
+        count=$(printf '%s' "$line" | jq -r '.data.count // 10')
+        port_in_use_local() {
+          local p="$1"
+          if command -v lsof >/dev/null 2>&1; then
+            lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+          elif command -v ss >/dev/null 2>&1; then
+            ss -lnt "sport = :$p" 2>/dev/null | awk 'NR>1{exit 0} END{exit 1}' && return 0
+          elif command -v netstat >/dev/null 2>&1; then
+            netstat -lnt 2>/dev/null | awk -v p=":$p" '$4 ~ p{found=1} END{exit found?0:1}' && return 0
+          else
+            nc -z localhost "$p" >/dev/null 2>&1 && return 0
+          fi
+          return 1
+        }
+        local p=$(( base + 1 )) found=0 arr=()
+        while (( found < count )) && (( p <= 65535 )); do
+          if ! port_in_use_local "$p"; then
+            arr+=("$p"); found=$((found+1))
+          fi
+          p=$((p+1))
+        done
+        local ports_json; ports_json=$(printf '%s\n' "${arr[*]}" | jq -R 'split(" ") | map(select(length>0)) | map(tonumber)')
+        local resp; resp=$(jq -n --argjson ports "$ports_json" '{ports:$ports}')
+        printf '{"type":"SuggestPortsResult","requestId":%s,"data":%s}\n' "$(printf '%s' "$req_id" | json_escape)" "$resp" >&3
       fi
     fi
   done

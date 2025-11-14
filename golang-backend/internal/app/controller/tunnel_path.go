@@ -91,17 +91,13 @@ func TunnelPathCheck(c *gin.Context) {
         c.JSON(http.StatusOK, response.ErrMsg("隧道不存在"))
         return
     }
-    // Only meaningful for tunnel-forward
-    if t.Type != 2 {
-        c.JSON(http.StatusOK, response.Ok(map[string]any{"hops": []any{}, "ok": true}))
-        return
-    }
-    // build hop list: entry -> mids -> exit
+    // build hop list
     path := getTunnelPathNodes(t.ID)
     hops := make([]int64, 0, 2+len(path))
     hops = append(hops, t.InNodeID)
     hops = append(hops, path...)
-    if t.OutNodeID != nil { hops = append(hops, *t.OutNodeID) }
+    // Only tunnel-forward (type=2) has exit node hop
+    if t.Type == 2 && t.OutNodeID != nil { hops = append(hops, *t.OutNodeID) }
 
     out := make([]map[string]any, 0, len(hops))
     allOK := true
@@ -114,7 +110,7 @@ func TunnelPathCheck(c *gin.Context) {
         _ = dbpkg.DB.First(&n, nid).Error
         role := "mid"
         if idx == 0 { role = "entry" }
-        if idx == len(hops)-1 { role = "exit" }
+        if t.Type == 2 && idx == len(hops)-1 { role = "exit" }
         online := (n.Status != nil && *n.Status == 1)
         if !online { allOK = false }
         // collect relay presence via QueryServices
@@ -133,13 +129,24 @@ func TunnelPathCheck(c *gin.Context) {
                 }
             }
         }
-        // propose free port for middle nodes only
+        // propose free port for middle nodes only; include suggestions list from agent
         proposed := 0
+        suggestions := []int{}
         if role == "mid" {
             minP := 10000; maxP := 65535
             if n.PortSta > 0 { minP = n.PortSta }
             if n.PortEnd > 0 { maxP = n.PortEnd }
-            proposed = findFreePortOnNode(nid, preferPort, minP, maxP)
+            base := preferPort
+            if base <= 0 { base = minP - 1 }
+            if base < 0 { base = 0 }
+            if arr := suggestPortsViaAgent(nid, base, 10); len(arr) > 0 {
+                // filter to range and capture
+                for _, p2 := range arr { if p2 >= minP && p2 <= maxP { suggestions = append(suggestions, p2) } }
+                if len(suggestions) > 0 { proposed = suggestions[0] }
+            }
+            if proposed == 0 {
+                proposed = findFreePortOnNode(nid, preferPort, minP, maxP)
+            }
             if proposed == 0 { allOK = false }
         }
         out = append(out, map[string]any{
@@ -149,6 +156,7 @@ func TunnelPathCheck(c *gin.Context) {
             "online": online,
             "relayGrpc": relayGrpc,
             "proposedPort": proposed,
+            "suggestedPorts": suggestions,
         })
     }
     c.JSON(http.StatusOK, response.Ok(map[string]any{"hops": out, "ok": allOK}))

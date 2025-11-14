@@ -163,7 +163,7 @@ func SystemInfoWS(c *gin.Context) {
 			// Try to parse as command reply first
 			var generic map[string]interface{}
             if err := json.Unmarshal(msg, &generic); err == nil {
-                if t, ok := generic["type"].(string); ok && (t == "DiagnoseResult" || t == "QueryServicesResult") {
+                if t, ok := generic["type"].(string); ok && (t == "DiagnoseResult" || t == "QueryServicesResult" || t == "SuggestPortsResult") {
                     if reqID, ok := generic["requestId"].(string); ok {
                         diagMu.Lock()
                         ch := diagWaiters[reqID]
@@ -480,15 +480,21 @@ func parseNodeSystemInfo(secret string, msg []byte) map[string]interface{} {
 }
 
 func convertSysInfoJSON(b []byte) map[string]interface{} {
-	var in map[string]interface{}
-	if err := json.Unmarshal(b, &in); err != nil {
-		return nil
-	}
+    var in map[string]interface{}
+    if err := json.Unmarshal(b, &in); err != nil {
+        return nil
+    }
+    // unwrap common wrappers: {event:"sysinfo_report", payload:{...}}
+    if v, ok := in["payload"]; ok {
+        if m, ok2 := v.(map[string]interface{}); ok2 {
+            in = m
+        }
+    }
     // map known fields to snake_case expected by frontend
     out := map[string]interface{}{}
-	if v, ok := in["Uptime"]; ok {
-		out["uptime"] = v
-	} else if v, ok := in["uptime"]; ok {
+    if v, ok := in["Uptime"]; ok {
+        out["uptime"] = v
+    } else if v, ok := in["uptime"]; ok {
 		out["uptime"] = v
 	}
 	if v, ok := in["BytesReceived"]; ok {
