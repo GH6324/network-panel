@@ -7,6 +7,7 @@ import (
     "io"
     "net/http"
     "os"
+    "os/exec"
     "path/filepath"
     "strings"
     "time"
@@ -114,6 +115,62 @@ func VersionUpgrade(c *gin.Context) {
         "created": made,
     }
     if len(errs) > 0 { out["errors"] = errs }
+    // Extra step: fetch install assets from main branch and place into install dir
+    installDir := detectInstallDir()
+    if installDir == "" {
+        installDir = "/opt/network-panel"
+    }
+    _ = os.MkdirAll(installDir, 0o755)
+    _ = os.MkdirAll(filepath.Join(installDir, "easytier"), 0o755)
+
+    // Raw files from main branch
+    rawInstall := "https://raw.githubusercontent.com/NiuStar/network-panel/refs/heads/main/install.sh"
+    rawEtConf := "https://raw.githubusercontent.com/NiuStar/network-panel/refs/heads/main/easytier/default.conf"
+    rawEtInstall := "https://raw.githubusercontent.com/NiuStar/network-panel/refs/heads/main/easytier/install.sh"
+    // allow proxyPrefix for these raw downloads
+    ri := rawInstall
+    rc := rawEtConf
+    re := rawEtInstall
+    if p.ProxyPrefix != "" {
+        ri = p.ProxyPrefix + rawInstall
+        rc = p.ProxyPrefix + rawEtConf
+        re = p.ProxyPrefix + rawEtInstall
+    }
+    if err := downloadToPath(ri, filepath.Join(installDir, "install.sh"), 0o755); err != nil {
+        errs = append(errs, fmt.Sprintf("install.sh 下载失败: %v", err))
+    } else {
+        made["install.sh"] = filepath.Join(installDir, "install.sh")
+    }
+    if err := downloadToPath(rc, filepath.Join(installDir, "easytier", "default.conf"), 0o644); err != nil {
+        errs = append(errs, fmt.Sprintf("easytier/default.conf 下载失败: %v", err))
+    } else {
+        made["easytier/default.conf"] = filepath.Join(installDir, "easytier", "default.conf")
+    }
+    if err := downloadToPath(re, filepath.Join(installDir, "easytier", "install.sh"), 0o755); err != nil {
+        errs = append(errs, fmt.Sprintf("easytier/install.sh 下载失败: %v", err))
+    } else {
+        made["easytier/install.sh"] = filepath.Join(installDir, "easytier", "install.sh")
+    }
+
+    out["created"] = made
+    if len(errs) > 0 { out["errors"] = errs }
+
+    // Try to restart service/process
+    if isDocker() {
+        out["restart"] = "docker-exit"
+        // respond first, then exit to let container runtime restart
+        c.JSON(http.StatusOK, response.Ok(out))
+        go func() { time.Sleep(1 * time.Second); os.Exit(0) }()
+        return
+    }
+    // binary install: attempt systemctl restart network-panel
+    if err := exec.Command("systemctl", "restart", "network-panel").Run(); err != nil {
+        errs = append(errs, fmt.Sprintf("重启服务失败: %v", err))
+        out["errors"] = errs
+        out["restart"] = "manual"
+    } else {
+        out["restart"] = "systemctl"
+    }
     c.JSON(http.StatusOK, response.Ok(out))
 }
 
@@ -207,3 +264,25 @@ func unzipTo(zipPath, destDir string) error {
     return nil
 }
 
+// detectInstallDir returns container or binary install directory
+func detectInstallDir() string {
+    if isDocker() {
+        return "/app"
+    }
+    return "/opt/network-panel"
+}
+
+// isDocker tries to detect if running inside a Docker container
+func isDocker() bool {
+    if _, err := os.Stat("/.dockerenv"); err == nil {
+        return true
+    }
+    // best-effort: check cgroup info
+    if b, err := os.ReadFile("/proc/1/cgroup"); err == nil {
+        s := string(b)
+        if strings.Contains(s, ":/docker/") || strings.Contains(s, "/docker-") || strings.Contains(strings.ToLower(s), "containerd") {
+            return true
+        }
+    }
+    return false
+}

@@ -34,7 +34,7 @@ var (
 
 // versionBase is the agent semantic version (without role prefix).
 // final reported version is: go-agent-<versionBase> or go-agent2-<versionBase>
-var versionBase = "1.0.6.7"
+var versionBase = "1.0.7.0"
 var version = "" // computed in main()
 
 func isAgent2Binary() bool {
@@ -1028,6 +1028,46 @@ func suggestPorts(base, count int) []int {
 func addOrUpdateServices(services []map[string]any, updateOnly bool) error {
 	cfg := readGostConfig()
 	// merge optional chains injected per-service under _chains (upsert by name)
+	// 1) Merge observers from _observers
+	if arr, ok := cfg["observers"].([]any); ok {
+		// keep existing
+		_ = arr
+	}
+	observersAny, _ := cfg["observers"].([]any)
+	obsIdx := map[string]int{}
+	for i, it := range observersAny {
+		if m, ok := it.(map[string]any); ok {
+			if n, ok2 := m["name"].(string); ok2 && n != "" {
+				obsIdx[n] = i
+			}
+		}
+	}
+	for _, svc := range services {
+		if extra, ok := svc["_observers"]; ok {
+			if arr, ok2 := extra.([]any); ok2 {
+				for _, it := range arr {
+					if m, ok3 := it.(map[string]any); ok3 {
+						n, _ := m["name"].(string)
+						if n == "" {
+							continue
+						}
+						if i, ok4 := obsIdx[n]; ok4 {
+							observersAny[i] = m
+						} else {
+							observersAny = append(observersAny, m)
+							obsIdx[n] = len(observersAny) - 1
+						}
+					}
+				}
+			}
+			delete(svc, "_observers")
+		}
+	}
+	if len(observersAny) > 0 {
+		cfg["observers"] = observersAny
+	}
+
+	// 2) Merge chains from _chains
 	chainsAny, _ := cfg["chains"].([]any)
 	chainIdx := map[string]int{}
 	for i, it := range chainsAny {
@@ -1105,11 +1145,44 @@ func addOrUpdateServices(services []map[string]any, updateOnly bool) error {
 			continue
 		}
 		if i, ok := idx[name]; ok {
-			// replace existing
-			arrAny[i] = svc
-		} else if !updateOnly {
-			arrAny = append(arrAny, svc)
-			idx[name] = len(arrAny) - 1
+			if updateOnly {
+				// merge into existing (handler-level merge)
+				if existing, ok2 := arrAny[i].(map[string]any); ok2 {
+					if hNew, okH := svc["handler"].(map[string]any); okH && hNew != nil {
+						hOld, _ := existing["handler"].(map[string]any)
+						if hOld == nil {
+							hOld = map[string]any{}
+						}
+						for k, v := range hNew {
+							hOld[k] = v
+						}
+						existing["handler"] = hOld
+					}
+					arrAny[i] = existing
+				} else {
+					arrAny[i] = svc
+				}
+			} else {
+				// replace existing
+				arrAny[i] = svc
+			}
+		} else {
+			// missing service
+			if updateOnly {
+				// Add only if looks complete (has addr or listener)
+				addr, _ := svc["addr"].(string)
+				hasListener := false
+				if lst, ok2 := svc["listener"].(map[string]any); ok2 && len(lst) > 0 {
+					hasListener = true
+				}
+				if addr != "" || hasListener {
+					arrAny = append(arrAny, svc)
+					idx[name] = len(arrAny) - 1
+				}
+			} else {
+				arrAny = append(arrAny, svc)
+				idx[name] = len(arrAny) - 1
+			}
 		}
 	}
 	cfg["services"] = arrAny

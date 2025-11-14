@@ -59,22 +59,45 @@ func SystemInfoWS(c *gin.Context) {
 		return
 	}
 
-	// Admin monitor channel
-	if nodeType == "0" {
-		adminMu.Lock()
-		adminConns[conn] = struct{}{}
-		adminMu.Unlock()
-		// keep read loop to detect close
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				adminMu.Lock()
-				delete(adminConns, conn)
-				adminMu.Unlock()
-				conn.Close()
-				return
-			}
-		}
-	}
+    // Admin monitor channel
+    if nodeType == "0" {
+        adminMu.Lock()
+        adminConns[conn] = struct{}{}
+        adminMu.Unlock()
+        // send initial snapshot: node online statuses + last sysinfo samples
+        go func(c *websocket.Conn){
+            // send current statuses
+            var nodes []model.Node
+            dbpkg.DB.Find(&nodes)
+            for _, n := range nodes {
+                b, _ := json.Marshal(map[string]interface{}{"id": n.ID, "type": "status", "data": ifThenBool(n.Status!=nil && *n.Status==1, 1, 0)})
+                _ = c.WriteMessage(websocket.TextMessage, b)
+                // last sysinfo
+                var s model.NodeSysInfo
+                if err := dbpkg.DB.Where("node_id = ?", n.ID).Order("time_ms desc").First(&s).Error; err == nil && s.NodeID > 0 {
+                    payload := map[string]interface{}{
+                        "uptime": s.Uptime,
+                        "bytes_received": s.BytesRx,
+                        "bytes_transmitted": s.BytesTx,
+                        "cpu_usage": s.CPU,
+                        "memory_usage": s.Mem,
+                    }
+                    b2, _ := json.Marshal(map[string]interface{}{"id": n.ID, "type": "info", "data": payload})
+                    _ = c.WriteMessage(websocket.TextMessage, b2)
+                }
+            }
+        }(conn)
+        // keep read loop to detect close
+        for {
+            if _, _, err := conn.ReadMessage(); err != nil {
+                adminMu.Lock()
+                delete(adminConns, conn)
+                adminMu.Unlock()
+                conn.Close()
+                return
+            }
+        }
+    }
 
 	// Node agent channel
 	var node model.Node
@@ -115,6 +138,18 @@ func SystemInfoWS(c *gin.Context) {
             jlog(map[string]interface{}{"event": "agent_upgrade_trigger", "nodeId": node.ID, "from": version, "to": expected, "role": role})
             _ = sendWSCommand(node.ID, "UpgradeAgent", map[string]any{"to": expected})
         }
+
+        // On reconnect: re-apply desired entry services (port-forward) with unified observer in case of drift
+        if svcs := desiredServices(node.ID); len(svcs) > 0 {
+            _ = sendWSCommand(node.ID, "AddService", svcs)
+            jlog(map[string]interface{}{"event": "reapply_desired_services", "nodeId": node.ID, "count": len(svcs)})
+        }
+        if patches := BuildTunnelEntryObserverPatches(node.ID); len(patches) > 0 {
+            _ = sendWSCommand(node.ID, "UpdateService", patches)
+            jlog(map[string]interface{}{"event": "tunnel_entry_observer_patched", "nodeId": node.ID, "count": len(patches)})
+        }
+        // Restart gost after applying changes to ensure effect
+        _ = sendWSCommand(node.ID, "RestartGost", map[string]any{"reason": "agent_reconnect_apply"})
 
 		// read messages and forward system info
 		for {
@@ -476,8 +511,11 @@ func parseNodeSystemInfo(secret string, msg []byte) map[string]interface{} {
 		return nil
 	}
 	// else assume msg is JSON object with camelCase keys
-	return convertSysInfoJSON(msg)
+    return convertSysInfoJSON(msg)
 }
+
+// small helper: ternary for ints used in initial snapshot
+func ifThenBool(cond bool, a int, b int) int { if cond { return a } ; return b }
 
 func convertSysInfoJSON(b []byte) map[string]interface{} {
     var in map[string]interface{}

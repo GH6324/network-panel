@@ -98,10 +98,14 @@ func desiredServices(nodeID int64) []map[string]any {
 			// Do not compute desired services for tunnel-forward; these are managed at create/update time
 			continue
 		} else {
-			if r.InNodeID == nodeID {
-				svc := buildServiceConfig(name, r.InPort, r.RemoteAddr, iface)
-				services = append(services, svc)
-			}
+            if r.InNodeID == nodeID {
+                svc := buildServiceConfig(name, r.InPort, r.RemoteAddr, iface)
+                if obsName, spec := buildObserverPluginSpec(nodeID, name); obsName != "" && spec != nil {
+                    svc["observer"] = obsName
+                    svc["_observers"] = []any{spec}
+                }
+                services = append(services, svc)
+            }
 		}
 	}
 	return services

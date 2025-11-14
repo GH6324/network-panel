@@ -229,6 +229,36 @@ export default function ForwardPage() {
   const [previewTunnelMap, setPreviewTunnelMap] = useState<Record<number, any>>({});
 
   useEffect(() => { loadData(); }, []);
+
+  // 轮询刷新每条转发的进/出流量（每 5s）
+  useEffect(() => {
+    let timer: any;
+    const tick = async () => {
+      try {
+        const res: any = await getForwardList();
+        if (res && res.code === 0 && Array.isArray(res.data)) {
+          const flowMap = new Map<number, { inFlow: number; outFlow: number }>();
+          (res.data as any[]).forEach((it: any) => {
+            if (typeof it?.id === 'number') {
+              flowMap.set(it.id, { inFlow: Number(it.inFlow || 0), outFlow: Number(it.outFlow || 0) });
+            }
+          });
+          setForwards((prev) => prev.map(f => {
+            const m = flowMap.get(f.id);
+            if (!m) return f;
+            if (m.inFlow === f.inFlow && m.outFlow === f.outFlow) return f;
+            return { ...f, inFlow: m.inFlow, outFlow: m.outFlow };
+          }));
+        }
+      } catch (_) {
+        // 忽略错误，下一次轮询继续
+      }
+    };
+    // 立即跑一次，随后每 5s 轮询
+    tick();
+    timer = setInterval(tick, 5000);
+    return () => { if (timer) clearInterval(timer); };
+  }, []);
   
   function ForwardIfacePicker({ selectedTunnel, onSelect, active }: { selectedTunnel: Tunnel | null; onSelect:(ip:string)=>void; active:boolean }){
     const [ips, setIps] = useState<string[]>([]);

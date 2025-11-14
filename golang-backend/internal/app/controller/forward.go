@@ -108,14 +108,14 @@ func ForwardCreate(c *gin.Context) {
 		// gRPC HTTP 隧道（出口=relay+grpc，入口=http+chain(dialer=grpc, connector=relay)）
 		user := fmt.Sprintf("u-%d", f.ID)
 		pass := util.MD5(fmt.Sprintf("%d:%d", f.ID, f.CreatedTime))[:16]
-		outSvc := map[string]any{
-			"name":     name,
-			"addr":     fmt.Sprintf(":%d", *f.OutPort),
-			"listener": map[string]any{"type": "grpc"},
-			// 出口不再配置 chain，仅作为 relay 服务端
-			"handler":  map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}},
-			"metadata": map[string]any{"managedBy": "network-panel"},
-		}
+        outSvc := map[string]any{
+            "name":     name,
+            "addr":     fmt.Sprintf(":%d", *f.OutPort),
+            "listener": map[string]any{"type": "grpc"},
+            // 出口不再配置 chain，仅作为 relay 服务端
+            "handler":  map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}},
+            "metadata": map[string]any{"managedBy": "network-panel", "enableStats": true, "observer.period": "5s", "observer.resetTraffic": false},
+        }
 		_ = sendWSCommand(outNodeIDOr0(tun), "AddService", []map[string]any{outSvc})
 
 		// 计算出口地址：优先使用出口节点的监听IP(在隧道编辑里配置的 inIp/bind)，否则使用隧道/节点出口IP
@@ -210,14 +210,14 @@ func ForwardCreate(c *gin.Context) {
 				/*if bindIP, ok := bindMap[nid]; ok && bindIP != "" {
 					addrStr = safeHostPort(bindIP, thisPort)
 				}*/
-				svc := map[string]any{
-					"name":      midName,
-					"addr":      addrStr,
-					"listener":  map[string]any{"type": "tcp"},
-					"handler":   map[string]any{"type": "forward"},
-					"forwarder": map[string]any{"nodes": []map[string]any{{"name": "target", "addr": target}}},
-					"metadata":  map[string]any{"managedBy": "network-panel"},
-				}
+                svc := map[string]any{
+                    "name":      midName,
+                    "addr":      addrStr,
+                    "listener":  map[string]any{"type": "tcp"},
+                    "handler":   map[string]any{"type": "forward"},
+                    "forwarder": map[string]any{"nodes": []map[string]any{{"name": "target", "addr": target}}},
+                    "metadata":  map[string]any{"managedBy": "network-panel", "enableStats": true, "observer.period": "5s", "observer.resetTraffic": false},
+                }
 				if iface != nil && *iface != "" {
 					svc["metadata"].(map[string]any)["interface"] = *iface
 				}
@@ -230,19 +230,23 @@ func ForwardCreate(c *gin.Context) {
 			// Entry node: forward handler + chain to first mid address using dialer=grpc（负载将被各中间节点逐跳TCP转发）
 			var first model.Node
 			if err := dbpkg.DB.First(&first, path[0]).Error; err == nil {
-				inSvc := map[string]any{
-					"name":     name,
-					"addr":     fmt.Sprintf(":%d", f.InPort),
-					"listener": map[string]any{"type": "tcp"},
-					"handler":  map[string]any{"type": "forward", "chain": "chain_" + name},
-					"metadata": map[string]any{"managedBy": "network-panel"},
+            inSvc := map[string]any{
+                "name":     name,
+                "addr":     fmt.Sprintf(":%d", f.InPort),
+                "listener": map[string]any{"type": "tcp"},
+                "handler":  map[string]any{"type": "forward", "chain": "chain_" + name},
+                "metadata": map[string]any{"managedBy": "network-panel", "enableStats": true, "observer.period": "5s", "observer.resetTraffic": false},
+            }
+            if obsName, spec := buildObserverPluginSpec(tun.InNodeID, name); obsName != "" && spec != nil {
+                inSvc["observer"] = obsName
+                inSvc["_observers"] = []any{spec}
+            }
+			// attach interface for entry if configured
+			if ip, ok := ifaceMap[tun.InNodeID]; ok && ip != "" {
+				if meta, ok2 := inSvc["metadata"].(map[string]any); ok2 {
+					meta["interface"] = ip
 				}
-				// attach interface for entry if configured
-				if ip, ok := ifaceMap[tun.InNodeID]; ok && ip != "" {
-					if meta, ok2 := inSvc["metadata"].(map[string]any); ok2 {
-						meta["interface"] = ip
-					}
-				}
+			}
 				chainName := "chain_" + name
 				hopName := "hop_" + name
 				node := map[string]any{
@@ -257,7 +261,7 @@ func ForwardCreate(c *gin.Context) {
 					"connector": map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}},
 					"dialer":    map[string]any{"type": "grpc"},
 				}
-				inSvc["_chains"] = []any{map[string]any{"name": chainName, "metadata": map[string]any{"managedBy": "network-panel"}, "hops": []any{map[string]any{"name": hopName, "nodes": []any{node}}}}}
+        inSvc["_chains"] = []any{map[string]any{"name": chainName, "metadata": map[string]any{"managedBy": "network-panel", "enableStats": true, "observer.period": "5s", "observer.resetTraffic": false}, "hops": []any{map[string]any{"name": hopName, "nodes": []any{node}}}}}
 				// forwarder 目标为远程地址（取第一项）
 				inSvc["forwarder"] = map[string]any{"nodes": []map[string]any{{"name": "target", "addr": firstTargetHost(f.RemoteAddr)}}}
 				_ = sendWSCommand(tun.InNodeID, "AddService", []map[string]any{inSvc})
@@ -268,13 +272,17 @@ func ForwardCreate(c *gin.Context) {
 			}
 		} else {
 			// Original single-hop: in -> exit relay
-			inSvc := map[string]any{
-				"name":     name,
-				"addr":     fmt.Sprintf(":%d", f.InPort),
-				"listener": map[string]any{"type": "tcp"},
-				"handler":  map[string]any{"type": "forward", "chain": "chain_" + name},
-				"metadata": map[string]any{"managedBy": "network-panel"},
-			}
+            inSvc := map[string]any{
+                "name":     name,
+                "addr":     fmt.Sprintf(":%d", f.InPort),
+                "listener": map[string]any{"type": "tcp"},
+                "handler":  map[string]any{"type": "forward", "chain": "chain_" + name},
+                "metadata": map[string]any{"managedBy": "network-panel", "enableStats": true, "observer.period": "5s", "observer.resetTraffic": false},
+            }
+            if obsName, spec := buildObserverPluginSpec(tun.InNodeID, name); obsName != "" && spec != nil {
+                inSvc["observer"] = obsName
+                inSvc["_observers"] = []any{spec}
+            }
 			chainName := "chain_" + name
 			hopName := "hop_" + name
 			node := map[string]any{
@@ -284,7 +292,7 @@ func ForwardCreate(c *gin.Context) {
 				"connector": map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}},
 				"dialer":    map[string]any{"type": "grpc"},
 			}
-			inSvc["_chains"] = []any{map[string]any{"name": chainName, "metadata": map[string]any{"managedBy": "network-panel"}, "hops": []any{map[string]any{"name": hopName, "nodes": []any{node}}}}}
+            inSvc["_chains"] = []any{map[string]any{"name": chainName, "metadata": map[string]any{"managedBy": "network-panel", "enableStats": true, "observer.period": "5s", "observer.resetTraffic": false}, "hops": []any{map[string]any{"name": hopName, "nodes": []any{node}}}}}
 			// forwarder 目标为远程地址（取第一项）
 			inSvc["forwarder"] = map[string]any{"nodes": []map[string]any{{"name": "target", "addr": firstTargetHost(f.RemoteAddr)}}}
 			_ = sendWSCommand(tun.InNodeID, "AddService", []map[string]any{inSvc})
@@ -325,7 +333,11 @@ func ForwardCreate(c *gin.Context) {
 			} else {
 				iface = preferIface(f.InterfaceName, tun.InterfaceName)
 			}
-			svc := buildServiceConfig(name, f.InPort, f.RemoteAddr, iface)
+            svc := buildServiceConfig(name, f.InPort, f.RemoteAddr, iface)
+            if obsName, spec := buildObserverPluginSpec(tun.InNodeID, name); obsName != "" && spec != nil {
+                svc["observer"] = obsName
+                svc["_observers"] = []any{spec}
+            }
 			_ = sendWSCommand(tun.InNodeID, "AddService", []map[string]any{svc})
 			_ = sendWSCommand(tun.InNodeID, "RestartGost", map[string]any{"reason": "forward_create"})
 		} else {
@@ -506,13 +518,13 @@ func ForwardUpdate(c *gin.Context) {
 		if ip, ok := bindMap[outNodeIDOr0(tun)]; ok && ip != "" {
 			addrStr = safeHostPort(ip, *f.OutPort)
 		}
-		outSvc := map[string]any{
-			"name":     name,
-			"addr":     addrStr,
-			"listener": map[string]any{"type": "grpc"},
-			"handler":  map[string]any{"type": "relay", "auth": map[string]any{"username": fmt.Sprintf("u-%d", f.ID), "password": util.MD5(fmt.Sprintf("%d:%d", f.ID, f.CreatedTime))[:16]}},
-			"metadata": map[string]any{"managedBy": "network-panel"},
-		}
+        outSvc := map[string]any{
+            "name":     name,
+            "addr":     addrStr,
+            "listener": map[string]any{"type": "grpc"},
+            "handler":  map[string]any{"type": "relay", "auth": map[string]any{"username": fmt.Sprintf("u-%d", f.ID), "password": util.MD5(fmt.Sprintf("%d:%d", f.ID, f.CreatedTime))[:16]}},
+            "metadata": map[string]any{"managedBy": "network-panel", "enableStats": true, "observer.period": "5s", "observer.resetTraffic": false},
+        }
 		_ = sendWSCommand(outNodeIDOr0(tun), "AddService", []map[string]any{outSvc})
 		if b, err := json.Marshal(outSvc); err == nil {
 			s := string(b)
@@ -596,14 +608,14 @@ func ForwardUpdate(c *gin.Context) {
 				if bindIP, ok := bindMap[nid]; ok && bindIP != "" {
 					listen = safeHostPort(bindIP, thisPort)
 				}
-				svc := map[string]any{
-					"name":      midName,
-					"addr":      listen,
-					"listener":  map[string]any{"type": "tcp"},
-					"handler":   map[string]any{"type": "forward"},
-					"forwarder": map[string]any{"nodes": []map[string]any{{"name": "target", "addr": target}}},
-					"metadata":  map[string]any{"managedBy": "network-panel"},
-				}
+                svc := map[string]any{
+                    "name":      midName,
+                    "addr":      listen,
+                    "listener":  map[string]any{"type": "tcp"},
+                    "handler":   map[string]any{"type": "forward"},
+                    "forwarder": map[string]any{"nodes": []map[string]any{{"name": "target", "addr": target}}},
+                    "metadata":  map[string]any{"managedBy": "network-panel", "enableStats": true, "observer.period": "5s", "observer.resetTraffic": false},
+                }
 				if iface != nil && *iface != "" {
 					svc["metadata"].(map[string]any)["interface"] = *iface
 				}
@@ -641,7 +653,11 @@ func ForwardUpdate(c *gin.Context) {
 			tmp := ip
 			inIface = &tmp
 		}
-		inSvc := buildServiceConfig(name, f.InPort, firstTargetHost(f.RemoteAddr), inIface)
+        inSvc := buildServiceConfig(name, f.InPort, firstTargetHost(f.RemoteAddr), inIface)
+        if obsName, spec := buildObserverPluginSpec(tun.InNodeID, name); obsName != "" && spec != nil {
+            inSvc["observer"] = obsName
+            inSvc["_observers"] = []any{spec}
+        }
 		chainName := "chain_" + name
 		hopName := "hop_" + name
 		// ensure handler is forward and attach chain
@@ -659,7 +675,7 @@ func ForwardUpdate(c *gin.Context) {
 		}
 		node := map[string]any{"name": "node-" + name, "addr": entryTarget, "connector": map[string]any{"type": "relay", "auth": map[string]any{"username": user, "password": pass}}, "dialer": map[string]any{"type": "grpc"}}
 		inSvc["_chains"] = []any{map[string]any{"name": chainName, "hops": []any{map[string]any{"name": hopName, "nodes": []any{node}}}}}
-		_ = sendWSCommand(tun.InNodeID, "UpdateService", []map[string]any{inSvc})
+        _ = sendWSCommand(tun.InNodeID, "AddService", []map[string]any{inSvc})
 		if b, err := json.Marshal(inSvc); err == nil {
 			s := string(b)
 			_ = dbpkg.DB.Create(&model.NodeOpLog{TimeMs: time.Now().UnixMilli(), NodeID: tun.InNodeID, Cmd: "ForwardUpdateService", RequestID: opId, Success: 1, Message: "update entry svc", Stdout: &s}).Error
@@ -684,6 +700,10 @@ func ForwardUpdate(c *gin.Context) {
                 iface = preferIface(f.InterfaceName, tun.InterfaceName)
             }
             svc := buildServiceConfig(name, f.InPort, f.RemoteAddr, iface)
+            if obsName, spec := buildObserverPluginSpec(tun.InNodeID, name); obsName != "" && spec != nil {
+                svc["observer"] = obsName
+                svc["_observers"] = []any{spec}
+            }
             _ = sendWSCommand(tun.InNodeID, "AddService", []map[string]any{svc})
             if b, err := json.Marshal(svc); err == nil {
                 s := string(b)
@@ -1439,8 +1459,8 @@ func buildServiceConfig(name string, listenPort int, target string, iface *strin
 			}},
 		},
 	}
-	// attach panel-managed marker (compat with both keys) and optional interface
-	meta := map[string]any{"managedBy": "network-panel"}
+    // attach panel-managed marker and enable stats/observer defaults; optional interface
+    meta := map[string]any{"managedBy": "network-panel", "enableStats": true, "observer.period": "5s", "observer.resetTraffic": false}
 	if iface != nil && *iface != "" {
 		meta["interface"] = *iface
 	}
@@ -1643,7 +1663,7 @@ func buildSSService(name string, listenPort int, password string, method string,
 	}
 	// optional extras: observer, limiter, rlimiter, metadata
 	// base metadata includes panel marker
-	baseMeta := map[string]any{"managedBy": "network-panel"}
+    baseMeta := map[string]any{"managedBy": "network-panel", "enableStats": true, "observer.period": "5s", "observer.resetTraffic": false}
 	if len(opts) > 0 && opts[0] != nil {
 		o := opts[0]
 		if v, ok := o["observer"].(string); ok && v != "" {

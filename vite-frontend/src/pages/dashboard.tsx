@@ -6,7 +6,7 @@ import toast from 'react-hot-toast';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
 
-import { getUserPackageInfo, getRecentAlerts } from "@/api";
+import { getUserPackageInfo, getRecentAlerts, getForwardList } from "@/api";
 
 interface UserInfo {
   flow: number;
@@ -175,6 +175,35 @@ export default function DashboardPage() {
     // 加载最近告警（管理员可见）
     getRecentAlerts(20).then((res:any)=>{ if (res.code===0) setAlerts(res.data||[]); }).catch(()=>{});
     localStorage.setItem('e', '/dashboard');
+  }, []);
+
+  // 轮询刷新 forwardList 的进/出流量（每 5s）
+  useEffect(() => {
+    let timer: any;
+    const tick = async () => {
+      try {
+        const res: any = await getForwardList();
+        if (res && res.code === 0 && Array.isArray(res.data)) {
+          const flowMap = new Map<number, { inFlow: number; outFlow: number }>();
+          (res.data as any[]).forEach((it: any) => {
+            if (typeof it?.id === 'number') {
+              flowMap.set(it.id, { inFlow: Number(it.inFlow || 0), outFlow: Number(it.outFlow || 0) });
+            }
+          });
+          setForwardList(prev => prev.map(f => {
+            const m = flowMap.get(f.id);
+            if (!m) return f;
+            if (m.inFlow === f.inFlow && m.outFlow === f.outFlow) return f;
+            return { ...f, inFlow: m.inFlow, outFlow: m.outFlow } as any;
+          }));
+        }
+      } catch (_) {
+        // 忽略错误，下一轮继续
+      }
+    };
+    tick();
+    timer = setInterval(tick, 5000);
+    return () => { if (timer) clearInterval(timer); };
   }, []);
 
   const loadPackageData = async () => {

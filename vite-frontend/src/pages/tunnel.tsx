@@ -410,7 +410,7 @@ export default function TunnelPage() {
       // 0) 入口到 1.1.1.1（ICMP）仅端口转发执行
       if (tunnel.type === 1) {
         const r1 = await diagnoseTunnelStep(tunnel.id, 'entry');
-        if (r1.code === 0) append(r1.data); else append({ success: false, description: '入口外网连通性 (ICMP 1.1.1.1)', nodeName: '-', nodeId: '-', targetIp: '1.1.1.1', message: r1.msg || '失败' });
+        if (r1.code === 0) append(r1.data); else { append({ success: false, description: '入口外网连通性 (ICMP 1.1.1.1)', nodeName: '-', nodeId: '-', targetIp: '1.1.1.1', message: r1.msg || '失败' }); }
       }
 
       // 1) 逐跳ICMP（仅隧道转发）
@@ -427,7 +427,7 @@ export default function TunnelPage() {
       // 2) 出口到 1.1.1.1（ICMP）仅隧道转发
       if (tunnel.type === 2) {
         const r3 = await diagnoseTunnelStep(tunnel.id, 'exitPublic');
-        if (r3.code === 0) append(r3.data); else append({ success: false, description: '出口外网连通性', nodeName: '-', nodeId: '-', targetIp: '1.1.1.1', message: r3.msg || '失败' });
+        if (r3.code === 0) append(r3.data); else { append({ success: false, description: '出口外网连通性', nodeName: '-', nodeId: '-', targetIp: '1.1.1.1', message: r3.msg || '失败' }); }
       }
 
       // 3) iperf3 反向带宽测试（仅隧道转发）
@@ -442,6 +442,7 @@ export default function TunnelPage() {
           const did = (r4.data && (r4.data as any).diagId) ? String((r4.data as any).diagId) : '';
           if (did) setDiagReqId(did);
           append({ success: false, description: 'iperf3 反向带宽测试', nodeName: '-', nodeId: '-', targetIp: '-', message: r4.msg || '未支持或失败', ...(did? { diagId: did }: {}) });
+          if (did) setOpsOpen(true);
         }
       }
     } catch (e) {
