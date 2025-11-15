@@ -48,6 +48,7 @@ import {
   getSpeedLimitList,
   resetUserFlow
 } from '@/api';
+import { getCachedConfig } from '@/config/site';
 import { SearchIcon, EditIcon, DeleteIcon, UserIcon, SettingsIcon } from '@/components/icons';
 import { parseDate } from "@internationalized/date";
 
@@ -177,6 +178,30 @@ export default function UserPage() {
     loadTunnels();
     loadSpeedLimits();
   }, [pagination.current, pagination.size, searchKeyword]);
+
+  // 轮询刷新用户列表与（可选）当前用户的隧道用量，间隔从网站配置 poll_interval_sec 读取（默认3秒）
+  const [pollMs, setPollMs] = useState<number>(3000);
+  useEffect(() => { (async()=>{ try{ const v = await getCachedConfig('poll_interval_sec'); const n = Math.max(1, parseInt(String(v||'3'),10)); setPollMs(n*1000);}catch{}})(); }, []);
+  useEffect(() => {
+    let timer: any;
+    const tick = async () => {
+      try {
+        // 刷新用户列表（静默，不影响加载状态）
+        const res:any = await getAllUsers({ current: pagination.current, size: pagination.size, keyword: searchKeyword });
+        if (res && res.code === 0) {
+          setUsers(res.data || []);
+        }
+        // 若正在查看某个用户的隧道权限，则顺带刷新其用量
+        if (isTunnelModalOpen && currentUser?.id) {
+          const r2:any = await getUserTunnelList({ userId: currentUser.id });
+          if (r2 && r2.code === 0) setUserTunnels(r2.data || []);
+        }
+      } catch { /* ignore */ }
+    };
+    tick();
+    timer = setInterval(tick, pollMs);
+    return () => { if (timer) clearInterval(timer); };
+  }, [pollMs, pagination.current, pagination.size, searchKeyword, isTunnelModalOpen, currentUser?.id]);
 
   // 数据加载函数
   const loadUsers = async () => {

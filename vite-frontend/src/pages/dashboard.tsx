@@ -425,8 +425,10 @@ export default function DashboardPage() {
   };
 
   const calculateUserTotalUsedFlow = (): number => {
-    // 后端已按计费类型处理流量，前端直接使用入站+出站总和
-    return (userInfo.inFlow || 0) + (userInfo.outFlow || 0);
+    // 优先使用后端给的计费口径（usedBilled）；否则使用前端按单/双向规则汇总（totalFlowBytes）
+    const billed = (userInfo as any).usedBilled;
+    if (typeof billed === 'number' && billed >= 0) return billed;
+    return totalFlowBytes;
   };
 
   const calculateUsagePercentage = (type: 'flow' | 'forwards'): number => {

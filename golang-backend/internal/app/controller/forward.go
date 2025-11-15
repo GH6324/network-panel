@@ -17,6 +17,7 @@ import (
 	dbpkg "network-panel/golang-backend/internal/db"
 
 	"github.com/gin-gonic/gin"
+    "gorm.io/gorm"
 )
 
 // POST /api/v1/forward/create
@@ -890,11 +891,27 @@ func ForwardDiagnose(c *gin.Context) {
 		c.JSON(http.StatusOK, response.ErrMsg("参数错误"))
 		return
 	}
-	var f model.Forward
-	if err := dbpkg.DB.First(&f, p.ForwardID).Error; err != nil {
-		c.JSON(http.StatusOK, response.ErrMsg("转发不存在"))
-		return
-	}
+    var f model.Forward
+    if err := dbpkg.DB.First(&f, p.ForwardID).Error; err != nil {
+        c.JSON(http.StatusOK, response.ErrMsg("转发不存在"))
+        return
+    }
+    // auth: admin or owner or user has tunnel permission
+    if roleInf, ok := c.Get("role_id"); ok {
+        if role, _ := roleInf.(int); role != 0 {
+            if uidInf, ok2 := c.Get("user_id"); ok2 {
+                uid := uidInf.(int64)
+                if f.UserID != uid {
+                    var utCnt int64
+                    dbpkg.DB.Model(&model.UserTunnel{}).Where("user_id=? and tunnel_id=?", uid, f.TunnelID).Count(&utCnt)
+                    if utCnt == 0 {
+                        c.JSON(http.StatusForbidden, response.ErrMsg("权限不足"))
+                        return
+                    }
+                }
+            }
+        }
+    }
 	var t model.Tunnel
 	_ = dbpkg.DB.First(&t, f.TunnelID).Error
 	var inNode model.Node
@@ -1153,11 +1170,27 @@ func ForwardDiagnoseStep(c *gin.Context) {
 		c.JSON(http.StatusOK, response.ErrMsg("参数错误"))
 		return
 	}
-	var f model.Forward
-	if err := dbpkg.DB.First(&f, p.ForwardID).Error; err != nil {
-		c.JSON(http.StatusOK, response.ErrMsg("转发不存在"))
-		return
-	}
+    var f model.Forward
+    if err := dbpkg.DB.First(&f, p.ForwardID).Error; err != nil {
+        c.JSON(http.StatusOK, response.ErrMsg("转发不存在"))
+        return
+    }
+    // auth: admin or owner or user has tunnel permission
+    if roleInf, ok := c.Get("role_id"); ok {
+        if role, _ := roleInf.(int); role != 0 {
+            if uidInf, ok2 := c.Get("user_id"); ok2 {
+                uid := uidInf.(int64)
+                if f.UserID != uid {
+                    var utCnt int64
+                    dbpkg.DB.Model(&model.UserTunnel{}).Where("user_id=? and tunnel_id=?", uid, f.TunnelID).Count(&utCnt)
+                    if utCnt == 0 {
+                        c.JSON(http.StatusForbidden, response.ErrMsg("权限不足"))
+                        return
+                    }
+                }
+            }
+        }
+    }
 	var t model.Tunnel
 	_ = dbpkg.DB.First(&t, f.TunnelID).Error
 	var inNode, outNode model.Node
@@ -1249,7 +1282,7 @@ func ForwardDiagnoseStep(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, response.Ok(map[string]any{"results": items}))
 		return
-	case "iperf3":
+    case "iperf3":
 		if t.Type != 2 {
 			c.JSON(http.StatusOK, response.ErrMsg("仅隧道转发支持iperf3"))
 			return
@@ -1312,10 +1345,25 @@ func ForwardDiagnoseStep(c *gin.Context) {
 				bw = b
 			}
 		}
-		res = map[string]interface{}{
-			"success": success, "description": "iperf3 反向带宽测试", "nodeName": inNode.Name, "nodeId": inNode.ID,
-			"targetIp": exitIP, "targetPort": srvPort, "message": msgI, "bandwidthMbps": bw,
-		}
+        // Accumulate diagnosis traffic into usage when succeed
+        if success && bw > 0 {
+            duration := 5.0 // seconds (client payload uses 5s)
+            bytes := int64((bw * 1e6 / 8.0) * duration)
+            // add to out_flow as diagnostic consumption
+            dbpkg.DB.Model(&model.Forward{}).Where("id=?", f.ID).
+                Updates(map[string]any{"out_flow": gorm.Expr("out_flow + ?", bytes), "updated_time": time.Now().UnixMilli()})
+            dbpkg.DB.Model(&model.User{}).Where("id=?", f.UserID).
+                Updates(map[string]any{"out_flow": gorm.Expr("out_flow + ?", bytes), "updated_time": time.Now().UnixMilli()})
+            var ut model.UserTunnel
+            if err := dbpkg.DB.Where("user_id=? and tunnel_id=?", f.UserID, f.TunnelID).First(&ut).Error; err == nil && ut.ID > 0 {
+                dbpkg.DB.Model(&model.UserTunnel{}).Where("id=?", ut.ID).
+                    Updates(map[string]any{"out_flow": gorm.Expr("out_flow + ?", bytes)})
+            }
+        }
+        res = map[string]interface{}{
+            "success": success, "description": "iperf3 反向带宽测试", "nodeName": inNode.Name, "nodeId": inNode.ID,
+            "targetIp": exitIP, "targetPort": srvPort, "message": msgI, "bandwidthMbps": bw,
+        }
 	default:
 		c.JSON(http.StatusOK, response.ErrMsg("未知诊断步骤"))
 		return

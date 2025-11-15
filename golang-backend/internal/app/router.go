@@ -132,8 +132,8 @@ func RegisterRoutes(r *gin.Engine) {
 		forward.POST("/force-delete", middleware.Auth(), controller.ForwardForceDelete)
 		forward.POST("/pause", middleware.Auth(), controller.ForwardPause)
 		forward.POST("/resume", middleware.Auth(), controller.ForwardResume)
-		forward.POST("/diagnose", middleware.RequireRole(), controller.ForwardDiagnose)
-		forward.POST("/diagnose-step", middleware.RequireRole(), controller.ForwardDiagnoseStep)
+    forward.POST("/diagnose", middleware.Auth(), controller.ForwardDiagnose)
+    forward.POST("/diagnose-step", middleware.Auth(), controller.ForwardDiagnoseStep)
 		forward.POST("/update-order", middleware.Auth(), controller.ForwardUpdateOrder)
 	}
 

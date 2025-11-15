@@ -1,12 +1,12 @@
 package controller
 
 import (
-    "encoding/json"
-    "io"
-    "net/http"
-    "strconv"
-    "strings"
-    "time"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
 	"network-panel/golang-backend/internal/app/dto"
 	"network-panel/golang-backend/internal/app/model"
@@ -23,7 +23,7 @@ func FlowTest(c *gin.Context)   { c.String(http.StatusOK, "test") }
 // Updates forward/user/usertunnel flow counters and pauses when limits exceeded.
 func FlowUpload(c *gin.Context) {
 
-    secret := c.Query("secret")
+	secret := c.Query("secret")
 	// validate node by secret (silent fail to avoid leaking info)
 	var nodeCount int64
 	dbpkg.DB.Model(&model.Node{}).Where("secret = ?", secret).Count(&nodeCount)
@@ -33,7 +33,7 @@ func FlowUpload(c *gin.Context) {
 	}
 
 	// read raw body once; support old and new formats
-    body, _ := io.ReadAll(c.Request.Body)
+	body, _ := io.ReadAll(c.Request.Body)
 
 	// Try new observer events format first
 	type obsStats struct {
@@ -60,8 +60,12 @@ func FlowUpload(c *gin.Context) {
 			if strings.ToLower(e.Type) != "stats" {
 				continue
 			}
-			inBytes += e.Stats.InputBytes
-			outBytes += e.Stats.OutputBytes
+			if e.Stats.InputBytes > 0 {
+				inBytes += e.Stats.InputBytes
+			}
+			if e.Stats.OutputBytes > 0 {
+				outBytes += e.Stats.OutputBytes
+			}
 			if e.Service != "" {
 				serviceName = e.Service
 			}
@@ -95,54 +99,60 @@ func FlowUpload(c *gin.Context) {
 		var tun model.Tunnel
 		_ = dbpkg.DB.First(&tun, fwd.TunnelID).Error
 
-        inInc, outInc := inBytes, outBytes
-        // 配额判断：按单向（取本次入/出中较大的值）
-        quotaInc := inInc
-        if outInc > quotaInc { quotaInc = outInc }
+		inInc, outInc := inBytes, outBytes
+		// 配额判断：按单向（取本次入/出中较大的值）
+		quotaInc := inInc
+		if outInc > quotaInc {
+			quotaInc = outInc
+		}
 
-        // apply increments (forward, user, user_tunnel)
-        dbpkg.DB.Model(&model.Forward{}).Where("id = ?", fwdID).
-            Updates(map[string]any{"in_flow": gorm.Expr("in_flow + ?", inInc), "out_flow": gorm.Expr("out_flow + ?", outInc), "updated_time": time.Now().UnixMilli()})
-        dbpkg.DB.Model(&model.User{}).Where("id = ?", fwd.UserID).
-            Updates(map[string]any{"in_flow": gorm.Expr("in_flow + ?", inInc), "out_flow": gorm.Expr("out_flow + ?", outInc), "updated_time": time.Now().UnixMilli()})
+		// apply increments (forward, user, user_tunnel)
+		dbpkg.DB.Model(&model.Forward{}).Where("id = ?", fwdID).
+			Updates(map[string]any{"in_flow": gorm.Expr("in_flow + ?", inInc), "out_flow": gorm.Expr("out_flow + ?", outInc), "updated_time": time.Now().UnixMilli()})
+		dbpkg.DB.Model(&model.User{}).Where("id = ?", fwd.UserID).
+			Updates(map[string]any{"in_flow": gorm.Expr("in_flow + ?", inInc), "out_flow": gorm.Expr("out_flow + ?", outInc), "updated_time": time.Now().UnixMilli()})
 		// user_tunnel
 		var ut model.UserTunnel
 		if err := dbpkg.DB.Where("user_id=? and tunnel_id=?", fwd.UserID, fwd.TunnelID).First(&ut).Error; err == nil && ut.ID > 0 {
 			dbpkg.DB.Model(&model.UserTunnel{}).Where("id = ?", ut.ID).
 				Updates(map[string]any{"in_flow": gorm.Expr("in_flow + ?", inInc), "out_flow": gorm.Expr("out_flow + ?", outInc)})
 		}
-        // 24h statistics (per user, bucket by hour HH:00). For single-flow tunnel, count max(in,out); else sum.
-        func() {
-            calc := inInc + outInc
-            if tun.Flow == 1 {
-                if outInc > inInc { calc = outInc } else { calc = inInc }
-            }
-            // bucket key: HH:00 (UTC+8)
-            cst := time.FixedZone("UTC+8", 8*3600)
-            now := time.Now().In(cst)
-            hourKey := now.Format("15:00")
-            var rec model.StatisticsFlow
-            if err := dbpkg.DB.Where("user_id = ? AND time = ?", fwd.UserID, hourKey).First(&rec).Error; err == nil && rec.ID > 0 {
-                dbpkg.DB.Model(&model.StatisticsFlow{}).Where("id = ?", rec.ID).
-                    Updates(map[string]any{"flow": gorm.Expr("flow + ?", calc), "total_flow": gorm.Expr("total_flow + ?", calc)})
-            } else {
-                rec = model.StatisticsFlow{UserID: fwd.UserID, Flow: calc, TotalFlow: calc, Time: hourKey, CreatedTime: now.UnixMilli()}
-                _ = dbpkg.DB.Create(&rec).Error
-            }
-        }()
+		// 24h statistics (per user, bucket by hour HH:00). For single-flow tunnel, count max(in,out); else sum.
+		func() {
+			calc := inInc + outInc
+			if tun.Flow == 1 {
+				if outInc > inInc {
+					calc = outInc
+				} else {
+					calc = inInc
+				}
+			}
+			// bucket key: HH:00 (UTC+8)
+			cst := time.FixedZone("UTC+8", 8*3600)
+			now := time.Now().In(cst)
+			hourKey := now.Format("15:00")
+			var rec model.StatisticsFlow
+			if err := dbpkg.DB.Where("user_id = ? AND time = ?", fwd.UserID, hourKey).First(&rec).Error; err == nil && rec.ID > 0 {
+				dbpkg.DB.Model(&model.StatisticsFlow{}).Where("id = ?", rec.ID).
+					Updates(map[string]any{"flow": gorm.Expr("flow + ?", calc), "total_flow": gorm.Expr("total_flow + ?", calc)})
+			} else {
+				rec = model.StatisticsFlow{UserID: fwd.UserID, Flow: calc, TotalFlow: calc, Time: hourKey, CreatedTime: now.UnixMilli()}
+				_ = dbpkg.DB.Create(&rec).Error
+			}
+		}()
 
-        // limits：仅在配额判断时使用单向增量估算
-        var user model.User
-        if err := dbpkg.DB.First(&user, fwd.UserID).Error; err == nil {
-            limit := user.Flow * 1024 * 1024 * 1024
-            used := user.InFlow + user.OutFlow
-            projected := used + quotaInc - (inInc + outInc)
-            if (limit > 0 && projected > limit) || expired(user.ExpTime) || (user.Status != nil && *user.Status != 1) {
-                pauseAllUserForwards(user.ID)
-                s := 0
-                user.Status = &s
-                _ = dbpkg.DB.Save(&user).Error
-            }
+		// limits：仅在配额判断时使用单向增量估算
+		var user model.User
+		if err := dbpkg.DB.First(&user, fwd.UserID).Error; err == nil {
+			limit := user.Flow * 1024 * 1024 * 1024
+			used := user.InFlow + user.OutFlow
+			projected := used + quotaInc - (inInc + outInc)
+			if (limit > 0 && projected > limit) || expired(user.ExpTime) || (user.Status != nil && *user.Status != 1) {
+				pauseAllUserForwards(user.ID)
+				s := 0
+				user.Status = &s
+				_ = dbpkg.DB.Save(&user).Error
+			}
 		}
 		if ut.ID != 0 {
 			if overUTunnelLimit(ut) || expired(ut.ExpTime) || ut.Status != 1 {
@@ -180,43 +190,51 @@ func FlowUpload(c *gin.Context) {
 	}
 	var tun model.Tunnel
 	_ = dbpkg.DB.First(&tun, fwd.TunnelID).Error
-    inInc, outInc := payload.U, payload.D
-    quotaInc := inInc
-    if outInc > quotaInc { quotaInc = outInc }
+	inInc, outInc := payload.U, payload.D
+	quotaInc := inInc
+	if outInc > quotaInc {
+		quotaInc = outInc
+	}
 	dbpkg.DB.Model(&model.Forward{}).Where("id = ?", fwdID).Updates(map[string]any{"in_flow": gorm.Expr("in_flow + ?", inInc), "out_flow": gorm.Expr("out_flow + ?", outInc), "updated_time": time.Now().UnixMilli()})
 	dbpkg.DB.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{"in_flow": gorm.Expr("in_flow + ?", inInc), "out_flow": gorm.Expr("out_flow + ?", outInc), "updated_time": time.Now().UnixMilli()})
 	if utID != 0 {
 		dbpkg.DB.Model(&model.UserTunnel{}).Where("id = ?", utID).Updates(map[string]any{"in_flow": gorm.Expr("in_flow + ?", inInc), "out_flow": gorm.Expr("out_flow + ?", outInc)})
 	}
-    // 24h statistics bucket update (same rule as above)
-    func() {
-        calc := inInc + outInc
-        if tun.Flow == 1 { if outInc > inInc { calc = outInc } else { calc = inInc } }
-        cst := time.FixedZone("UTC+8", 8*3600)
-        now := time.Now().In(cst)
-        hourKey := now.Format("15:00")
-        var rec model.StatisticsFlow
-        if err := dbpkg.DB.Where("user_id = ? AND time = ?", userID, hourKey).First(&rec).Error; err == nil && rec.ID > 0 {
-            dbpkg.DB.Model(&model.StatisticsFlow{}).Where("id = ?", rec.ID).
-                Updates(map[string]any{"flow": gorm.Expr("flow + ?", calc), "total_flow": gorm.Expr("total_flow + ?", calc)})
-        } else {
-            rec = model.StatisticsFlow{UserID: userID, Flow: calc, TotalFlow: calc, Time: hourKey, CreatedTime: now.UnixMilli()}
-            _ = dbpkg.DB.Create(&rec).Error
-        }
-    }()
+	// 24h statistics bucket update (same rule as above)
+	func() {
+		calc := inInc + outInc
+		if tun.Flow == 1 {
+			if outInc > inInc {
+				calc = outInc
+			} else {
+				calc = inInc
+			}
+		}
+		cst := time.FixedZone("UTC+8", 8*3600)
+		now := time.Now().In(cst)
+		hourKey := now.Format("15:00")
+		var rec model.StatisticsFlow
+		if err := dbpkg.DB.Where("user_id = ? AND time = ?", userID, hourKey).First(&rec).Error; err == nil && rec.ID > 0 {
+			dbpkg.DB.Model(&model.StatisticsFlow{}).Where("id = ?", rec.ID).
+				Updates(map[string]any{"flow": gorm.Expr("flow + ?", calc), "total_flow": gorm.Expr("total_flow + ?", calc)})
+		} else {
+			rec = model.StatisticsFlow{UserID: userID, Flow: calc, TotalFlow: calc, Time: hourKey, CreatedTime: now.UnixMilli()}
+			_ = dbpkg.DB.Create(&rec).Error
+		}
+	}()
 
-    var user model.User
-    if err := dbpkg.DB.First(&user, userID).Error; err == nil {
-        limit := user.Flow * 1024 * 1024 * 1024
-        used := user.InFlow + user.OutFlow
-        projected := used + quotaInc - (inInc + outInc)
-        if (limit > 0 && projected > limit) || expired(user.ExpTime) || (user.Status != nil && *user.Status != 1) {
-            pauseAllUserForwards(user.ID)
-            s := 0
-            user.Status = &s
-            _ = dbpkg.DB.Save(&user).Error
-        }
-    }
+	var user model.User
+	if err := dbpkg.DB.First(&user, userID).Error; err == nil {
+		limit := user.Flow * 1024 * 1024 * 1024
+		used := user.InFlow + user.OutFlow
+		projected := used + quotaInc - (inInc + outInc)
+		if (limit > 0 && projected > limit) || expired(user.ExpTime) || (user.Status != nil && *user.Status != 1) {
+			pauseAllUserForwards(user.ID)
+			s := 0
+			user.Status = &s
+			_ = dbpkg.DB.Save(&user).Error
+		}
+	}
 	if utID != 0 {
 		var ut model.UserTunnel
 		if err := dbpkg.DB.First(&ut, utID).Error; err == nil {

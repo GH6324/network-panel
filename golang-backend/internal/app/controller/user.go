@@ -84,12 +84,40 @@ func UserCreate(c *gin.Context) {
 
 // POST /api/v1/user/list
 func UserList(c *gin.Context) {
-	var users []model.User
-	dbpkg.DB.Where("role_id <> ?", 0).Find(&users)
-	for i := range users {
-		users[i].Pwd = ""
-	}
-	c.JSON(http.StatusOK, response.Ok(users))
+    var users []model.User
+    dbpkg.DB.Where("role_id <> ?", 0).Find(&users)
+    // compute usedBilled per user: sum over forwards with tunnel.flow rule (single uses max(in,out), double uses in+out)
+    type agg struct{ UserID int64; Used int64 }
+    var aggs []agg
+    dbpkg.DB.Table("forward f").
+        Select("f.user_id as user_id, SUM(CASE WHEN t.flow = 1 THEN (CASE WHEN f.in_flow > f.out_flow THEN f.in_flow ELSE f.out_flow END) ELSE (f.in_flow + f.out_flow) END) as used").
+        Joins("left join tunnel t on t.id = f.tunnel_id").
+        Group("f.user_id").Scan(&aggs)
+    usedMap := map[int64]int64{}
+    for _, a := range aggs { usedMap[a.UserID] = a.Used }
+
+    // normalize to camelCase for frontend consistency
+    out := make([]map[string]any, 0, len(users))
+    for i := range users {
+        u := users[i]
+        m := map[string]any{
+            "id":             u.ID,
+            "createdTime":    u.CreatedTime,
+            "updatedTime":    u.UpdatedTime,
+            "status":         u.Status,
+            "user":           u.User,
+            "roleId":         u.RoleID,
+            "expTime":        u.ExpTime,
+            "flow":           u.Flow,
+            "inFlow":         u.InFlow,
+            "outFlow":        u.OutFlow,
+            "num":            u.Num,
+            "flowResetTime":  u.FlowResetTime,
+            "usedBilled":     usedMap[u.ID],
+        }
+        out = append(out, m)
+    }
+    c.JSON(http.StatusOK, response.Ok(out))
 }
 
 // POST /api/v1/user/update
@@ -184,15 +212,24 @@ func UserPackage(c *gin.Context) {
 		return
 	}
 
-	// build userInfo payload (camelCase)
-	userInfo := gin.H{
-		"flow":          user.Flow,
-		"inFlow":        user.InFlow,
-		"outFlow":       user.OutFlow,
-		"num":           user.Num,
-		"expTime":       user.ExpTime,
-		"flowResetTime": user.FlowResetTime,
-	}
+    // build userInfo payload (camelCase)
+    // compute billed used (sum over forwards by tunnel.flow rule)
+    type agg struct{ Used int64 }
+    var a agg
+    dbpkg.DB.Table("forward f").
+        Select("SUM(CASE WHEN t.flow = 1 THEN (CASE WHEN f.in_flow > f.out_flow THEN f.in_flow ELSE f.out_flow END) ELSE (f.in_flow + f.out_flow) END) as used").
+        Joins("left join tunnel t on t.id = f.tunnel_id").
+        Where("f.user_id = ?", uid).Scan(&a)
+
+    userInfo := gin.H{
+        "flow":          user.Flow,
+        "inFlow":        user.InFlow,
+        "outFlow":       user.OutFlow,
+        "num":           user.Num,
+        "expTime":       user.ExpTime,
+        "flowResetTime": user.FlowResetTime,
+        "usedBilled":    a.Used,
+    }
 
 	// tunnel permissions with names and tunnelFlow
 	var tunnelPermissions []struct {
