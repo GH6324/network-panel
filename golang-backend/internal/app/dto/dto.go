@@ -71,7 +71,7 @@ type NodeUpdateDto struct {
 // Tunnel
 type TunnelDto struct {
 	Name          string   `json:"name" binding:"required"`
-	InNodeID      int64    `json:"inNodeId" binding:"required"`
+	InNodeID      int64    `json:"inNodeId"`
 	OutNodeID     *int64   `json:"outNodeId"`
 	OutExitID     *int64   `json:"outExitId"`
 	OutIP         *string  `json:"outIp"`

@@ -38,11 +38,24 @@ func TunnelCreate(c *gin.Context) {
 		c.JSON(http.StatusOK, response.ErrMsg("隧道名称已存在"))
 		return
 	}
-	// in node exists
-	var in model.Node
-	if err := db.DB.First(&in, req.InNodeID).Error; err != nil {
+	if req.OutNodeID != nil && req.OutExitID != nil {
+		c.JSON(http.StatusOK, response.ErrMsg("出口节点与外部出口不可同时选择"))
+		return
+	}
+	externalOnly := req.InNodeID <= 0 && req.OutExitID != nil && *req.OutExitID > 0 && req.OutNodeID == nil
+	if req.InNodeID <= 0 && !externalOnly {
 		c.JSON(http.StatusOK, response.ErrMsg("入口节点不存在"))
 		return
+	}
+	// in node exists; external-only lines are subscription/direct exits and do not have an entry agent.
+	var in model.Node
+	inIP := ""
+	if req.InNodeID > 0 {
+		if err := db.DB.First(&in, req.InNodeID).Error; err != nil {
+			c.JSON(http.StatusOK, response.ErrMsg("入口节点不存在"))
+			return
+		}
+		inIP = in.IP
 	}
 	// set entity
 	now := time.Now().UnixMilli()
@@ -53,12 +66,8 @@ func TunnelCreate(c *gin.Context) {
 		owner = &tmp
 	}
 	t := model.Tunnel{BaseEntity: model.BaseEntity{CreatedTime: now, UpdatedTime: now, Status: &status},
-		Name: req.Name, OwnerID: owner, InNodeID: req.InNodeID, InIP: in.IP, Type: req.Type, Flow: req.Flow,
+		Name: req.Name, OwnerID: owner, InNodeID: req.InNodeID, InIP: inIP, Type: req.Type, Flow: req.Flow,
 		Protocol: req.Protocol, TrafficRatio: req.TrafficRatio, TCPListenAddr: req.TCPListenAddr, UDPListenAddr: req.UDPListenAddr, InterfaceName: req.InterfaceName,
-	}
-	if req.OutNodeID != nil && req.OutExitID != nil {
-		c.JSON(http.StatusOK, response.ErrMsg("出口节点与外部出口不可同时选择"))
-		return
 	}
 	if req.OutExitID != nil {
 		var ext model.ExitNodeExternal

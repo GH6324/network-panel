@@ -125,6 +125,7 @@ interface RouteItem {
   id: number;
   name: string;
   host?: string;
+  protocol?: string;
   isExit: boolean;
 }
 
@@ -338,6 +339,7 @@ const TunnelEditModal = memo(
               id: ext.exitId || 0,
               name: ext.name,
               host: ext.host,
+              protocol: ext.protocol,
               isExit: true,
             });
           }
@@ -378,6 +380,11 @@ const TunnelEditModal = memo(
           .filter((it) => it.type === "node")
           .map((it) => it.id);
 
+        const selectedExternal =
+          last?.type === "external"
+            ? externalExitNodes.find((n) => n.exitId === last.id)
+            : undefined;
+
         setForm((prev) => ({
           ...prev,
           inNodeId: entry.type === "node" ? entry.id : null,
@@ -385,10 +392,11 @@ const TunnelEditModal = memo(
             prev.type === 2 && last?.type === "node" ? last.id : null,
           outExitId:
             prev.type === 2 && last?.type === "external" ? last.id : null,
+          protocol: selectedExternal?.protocol || prev.protocol,
         }));
         setMidPath(midNodes);
       },
-      [setForm, setMidPath],
+      [externalExitNodes, setForm, setMidPath],
     );
 
     useEffect(() => {
@@ -629,6 +637,7 @@ const TunnelEditModal = memo(
           id: exitId,
           name: ext.name,
           host: ext.host,
+          protocol: ext.protocol,
           isExit: true,
         });
         return next;
@@ -675,11 +684,16 @@ const TunnelEditModal = memo(
         newErrors.name = "隧道名称长度应在2-50个字符之间";
       }
 
+      const isExternalOnlyRoute =
+        routeItems.length === 1 && routeItems[0]?.type === "external";
+
       if (routeItems.length === 0) {
         newErrors.route = "请选择线路节点";
       } else {
         const entry = routeItems[0];
-        if (!entry || entry.type !== "node") {
+        if (isExternalOnlyRoute && form.type !== 2) {
+          newErrors.route = "外部出口单独成线路时请选择隧道转发";
+        } else if (!isExternalOnlyRoute && (!entry || entry.type !== "node")) {
           newErrors.route = "入口必须是面板节点";
         }
       }
@@ -695,8 +709,8 @@ const TunnelEditModal = memo(
       }
 
       if (form.type === 2) {
-        if (routeItems.length < 2) {
-          newErrors.route = "隧道转发需要至少入口与出口";
+        if (routeItems.length < 2 && !isExternalOnlyRoute) {
+          newErrors.route = "隧道转发需要至少入口与出口，或只选择一个外部出口作为直连线路";
         } else {
           const entry = routeItems[0];
           const last = routeItems[routeItems.length - 1];
@@ -786,7 +800,9 @@ const TunnelEditModal = memo(
 
               if (lr && lr.code === 0 && Array.isArray(lr.data)) {
                 const candidates = (lr.data as any[]).filter(
-                  (x) => x.name === form.name && x.inNodeId === form.inNodeId,
+                  (x) =>
+                    x.name === form.name &&
+                    Number(x.inNodeId || 0) === Number(form.inNodeId || 0),
                 );
 
                 tid =
@@ -935,7 +951,7 @@ const TunnelEditModal = memo(
                   <Divider />
                   <h3 className="text-lg font-semibold">线路编排</h3>
                   <div className="text-sm text-default-500">
-                    点击节点卡片加入线路，拖动下方顺序。末端必须为出口节点。
+                    点击节点卡片加入线路，拖动下方顺序。末端必须为出口节点；也可只选择一个外部出口作为直连线路。
                   </div>
                   {errors.route ? (
                     <div className="text-xs text-danger-500">{errors.route}</div>
@@ -1625,6 +1641,7 @@ const TunnelCardGrid = memo(({
       renderItem={(tunnel) => {
         const statusDisplay = getStatusDisplay(tunnel.status);
         const typeDisplay = getTypeDisplay(tunnel.type);
+        const isExternalOnly = !!tunnel.outExitId && !tunnel.inNodeId;
 
         return (
           <Card
@@ -1665,11 +1682,13 @@ const TunnelCardGrid = memo(({
                   <div className="p-2 np-soft">
                     <div className="flex items-center justify-between mb-1">
                       <span className="text-xs font-medium text-default-600">
-                        入口节点
+                        {isExternalOnly ? "线路入口" : "入口节点"}
                       </span>
                     </div>
                     <code className="text-xs font-mono text-foreground block truncate">
-                      {getNodeName(tunnel.inNodeId)}
+                      {isExternalOnly
+                        ? "外部直连（无入口节点）"
+                        : getNodeName(tunnel.inNodeId)}
                     </code>
                     <code className="text-xs font-mono text-default-500 block truncate">
                       {getDisplayIp(tunnel.inIp)}
@@ -1745,6 +1764,7 @@ const TunnelCardGrid = memo(({
                 <Button
                   className="flex-1 min-h-8"
                   color="warning"
+                  isDisabled={isExternalOnly}
                   size="sm"
                   startContent={
                     <svg
@@ -1764,7 +1784,7 @@ const TunnelCardGrid = memo(({
                 >
                   诊断
                 </Button>
-                {tunnel.type === 2 && (
+                {tunnel.type === 2 && !isExternalOnly && (
                   <Button
                     className="flex-1 min-h-8"
                     color="secondary"
