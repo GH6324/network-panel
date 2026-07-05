@@ -773,6 +773,28 @@ func normalizeSiteCAPath(path string) string {
 	return p
 }
 
+func normalizeAnyTLSCertSHA256Pin(raw string) string {
+	pin := strings.TrimSpace(strings.ToLower(raw))
+	if pin == "" {
+		return ""
+	}
+	pin = strings.TrimPrefix(pin, "sha256:")
+	pin = strings.TrimPrefix(pin, "sha256=")
+	pin = strings.TrimPrefix(pin, "sha-256:")
+	pin = strings.TrimPrefix(pin, "sha-256=")
+	replacer := strings.NewReplacer(":", "", "-", "", " ", "")
+	pin = replacer.Replace(strings.TrimSpace(pin))
+	if len(pin) != 64 {
+		return ""
+	}
+	for _, r := range pin {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return ""
+		}
+	}
+	return pin
+}
+
 func buildSkipStrings(skipped []subSkip) []string {
 	out := make([]string, 0, len(skipped))
 	for _, s := range skipped {
@@ -2118,6 +2140,8 @@ func anyTLSParamString(params map[string]interface{}, key string) string {
 		return paramStringFirst(params, "egress-rule", "egress_rule")
 	case "ca-cert-path":
 		return paramStringFirst(params, "ca-cert-path", "ca_cert_path", "ca-cert", "ca_cert")
+	case "cert-sha256":
+		return paramStringFirst(params, "cert-sha256", "cert_sha256", "fingerprint", "fingerprint-sha256", "fingerprint_sha256")
 	case "skip-cert-verify":
 		return paramStringFirst(params, "skip-cert-verify", "skip_cert_verify", "insecure", "allow-insecure", "allow_insecure")
 	case "allow-insecure":
@@ -2954,6 +2978,9 @@ func buildAnyTLSURI(pass string, it subProxy, params map[string]interface{}) str
 	}
 	if caPath := normalizeSiteCAPath(anyTLSParamString(params, "ca-cert-path")); caPath != "" {
 		parts = append(parts, "ca-cert-path="+url.QueryEscape(caPath))
+	}
+	if pin := normalizeAnyTLSCertSHA256Pin(anyTLSParamString(params, "cert-sha256")); pin != "" {
+		parts = append(parts, "cert-sha256="+url.QueryEscape(pin))
 	}
 	if anyTLSSkipCertVerify(params) {
 		parts = append(parts, "insecure=1")

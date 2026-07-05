@@ -969,7 +969,7 @@ func TunnelDiagnoseStep(c *gin.Context) {
 		}
 		// 额外：读取入口节点 gost 配置文件内容用于诊断日志（best-effort）
 		if readyAll {
-			script := "#!/bin/sh\nset +e\nfor p in /etc/gost/gost.json /usr/local/gost/gost.json ./gost.json; do if [ -f \"$p\" ]; then echo \"PATH:$p\"; cat \"$p\"; exit 0; fi; done; echo 'PATH:NOT_FOUND'; exit 0\n"
+			script := buildGostConfigReadScript(gostConfigReadMaxBytes)
 			req := map[string]any{"requestId": RandUUID(), "timeoutSec": 8, "content": script}
 			if res, ok := RequestOp(inNode.ID, "RunScript", req, 10*time.Second); ok {
 				msg := "ok"

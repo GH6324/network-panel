@@ -70,6 +70,22 @@ func (a *adminClient) safeWriteMessage(b []byte) error {
 	return a.c.WriteMessage(websocket.TextMessage, b)
 }
 
+// safeWriteMessage writes a text message to terminal client with locking and deadline.
+func (t *terminalClient) safeWriteMessage(b []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_ = t.c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return t.c.WriteMessage(websocket.TextMessage, b)
+}
+
+func (t *terminalClient) safeWriteJSON(v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return t.safeWriteMessage(b)
+}
+
 // safePing sends a websocket Ping control frame with locking and deadline.
 func (a *adminClient) safePing() error {
 	a.mu.Lock()
@@ -77,6 +93,86 @@ func (a *adminClient) safePing() error {
 	_ = a.c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	// per gorilla/websocket, WriteControl is safe with deadlines
 	return a.c.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
+}
+
+func dropAdminClient(ac *adminClient) {
+	if ac == nil {
+		return
+	}
+	adminMu.Lock()
+	delete(adminConns, ac)
+	adminMu.Unlock()
+	if ac.c != nil {
+		_ = ac.c.Close()
+	}
+}
+
+func writeAdminClientsBoundedParallel(clients []*adminClient, b []byte, parallelism int, write func(*adminClient, []byte) error) []*adminClient {
+	if len(clients) == 0 {
+		return nil
+	}
+	if parallelism <= 0 {
+		parallelism = 1
+	}
+	if parallelism > len(clients) {
+		parallelism = len(clients)
+	}
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	drops := make([]*adminClient, 0)
+	for _, ac := range clients {
+		if ac == nil || write == nil {
+			continue
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(ac *adminClient) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := write(ac, b); err != nil {
+				mu.Lock()
+				drops = append(drops, ac)
+				mu.Unlock()
+			}
+		}(ac)
+	}
+	wg.Wait()
+	return drops
+}
+
+func writeTerminalClientsBoundedParallel(clients []*terminalClient, b []byte, parallelism int, write func(*terminalClient, []byte) error) []*terminalClient {
+	if len(clients) == 0 {
+		return nil
+	}
+	if parallelism <= 0 {
+		parallelism = 1
+	}
+	if parallelism > len(clients) {
+		parallelism = len(clients)
+	}
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	drops := make([]*terminalClient, 0)
+	for _, cli := range clients {
+		if cli == nil || write == nil {
+			continue
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(cli *terminalClient) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := write(cli, b); err != nil {
+				mu.Lock()
+				drops = append(drops, cli)
+				mu.Unlock()
+			}
+		}(cli)
+	}
+	wg.Wait()
+	return drops
 }
 
 var (
@@ -186,10 +282,7 @@ func SystemInfoWS(c *gin.Context) {
 			for range ticker.C {
 				if err := ac.safePing(); err != nil {
 					// drop and close; read-loop will exit as well
-					adminMu.Lock()
-					delete(adminConns, ac)
-					adminMu.Unlock()
-					_ = ac.c.Close()
+					dropAdminClient(ac)
 					return
 				}
 			}
@@ -201,7 +294,10 @@ func SystemInfoWS(c *gin.Context) {
 			dbpkg.DB.Find(&nodes)
 			for _, n := range nodes {
 				b, _ := json.Marshal(map[string]interface{}{"id": n.ID, "type": "status", "data": ifThenBool(n.Status != nil && *n.Status == 1, 1, 0)})
-				_ = ac.safeWriteMessage(b)
+				if err := ac.safeWriteMessage(b); err != nil {
+					dropAdminClient(ac)
+					return
+				}
 				// last sysinfo
 				var s model.NodeSysInfo
 				if err := dbpkg.DB.Where("node_id = ?", n.ID).Order("time_ms desc").First(&s).Error; err == nil && s.NodeID > 0 {
@@ -213,7 +309,10 @@ func SystemInfoWS(c *gin.Context) {
 						"memory_usage":      s.Mem,
 					}
 					b2, _ := json.Marshal(map[string]interface{}{"id": n.ID, "type": "info", "data": payload})
-					_ = ac.safeWriteMessage(b2)
+					if err := ac.safeWriteMessage(b2); err != nil {
+						dropAdminClient(ac)
+						return
+					}
 				}
 			}
 		}(cli)
@@ -603,23 +702,33 @@ func touchTermSession(nodeID int64) {
 func broadcastTerm(nodeID int64, payload map[string]any) {
 	b, _ := json.Marshal(payload)
 	termMu.RLock()
-	clients := termClients[nodeID]
+	clients := make([]*terminalClient, 0, len(termClients[nodeID]))
+	for cli := range termClients[nodeID] {
+		clients = append(clients, cli)
+	}
 	termMu.RUnlock()
-	for cli := range clients {
+	drops := writeTerminalClientsBoundedParallel(clients, b, getEnvInt("WS_BROADCAST_PARALLELISM", 16), func(cli *terminalClient, msg []byte) error {
 		if cli == nil || cli.c == nil {
-			continue
+			return nil
 		}
-		cli.mu.Lock()
-		_ = cli.c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		err := cli.c.WriteMessage(websocket.TextMessage, b)
-		cli.mu.Unlock()
-		if err != nil {
-			termMu.Lock()
-			delete(clients, cli)
-			termMu.Unlock()
+		return cli.safeWriteMessage(msg)
+	})
+	if len(drops) == 0 {
+		return
+	}
+	termMu.Lock()
+	for _, cli := range drops {
+		if set := termClients[nodeID]; set != nil {
+			delete(set, cli)
+			if len(set) == 0 {
+				delete(termClients, nodeID)
+			}
+		}
+		if cli != nil && cli.c != nil {
 			_ = cli.c.Close()
 		}
 	}
+	termMu.Unlock()
 }
 
 func setTermRunning(nodeID int64, running bool) {
@@ -646,6 +755,7 @@ func cleanupTermSessions() {
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
+		expiredClients := make([]*terminalClient, 0)
 		termMu.Lock()
 		expired := make([]int64, 0)
 		for nid, ts := range termSessions {
@@ -664,15 +774,22 @@ func cleanupTermSessions() {
 			delete(termSessions, nid)
 			if clients := termClients[nid]; len(clients) > 0 {
 				for cli := range clients {
-					if cli != nil && cli.c != nil {
-						_ = cli.c.WriteMessage(websocket.TextMessage, []byte(`{"type":"expired"}`))
-						_ = cli.c.Close()
-					}
+					expiredClients = append(expiredClients, cli)
 				}
 			}
 			delete(termClients, nid)
 		}
 		termMu.Unlock()
+		if len(expiredClients) > 0 {
+			b := []byte(`{"type":"expired"}`)
+			_ = writeTerminalClientsBoundedParallel(expiredClients, b, getEnvInt("WS_BROADCAST_PARALLELISM", 16), func(cli *terminalClient, msg []byte) error {
+				if cli != nil && cli.c != nil {
+					_ = cli.safeWriteMessage(msg)
+					_ = cli.c.Close()
+				}
+				return nil
+			})
+		}
 	}
 }
 
@@ -758,9 +875,21 @@ func NodeTerminalWS(c *gin.Context) {
 
 	// send history if exists
 	if ts != nil && ts.history.Len() > 0 {
-		_ = cli.c.WriteJSON(map[string]any{"type": "history", "data": ts.history.String(), "running": ts.running})
+		if err := cli.safeWriteJSON(map[string]any{"type": "history", "data": ts.history.String(), "running": ts.running}); err != nil {
+			termMu.Lock()
+			if set, ok := termClients[nid]; ok {
+				delete(set, cli)
+				if len(set) == 0 {
+					delete(termClients, nid)
+				}
+			}
+			termMu.Unlock()
+			_ = conn.Close()
+			return
+		}
 	}
 
+	closeTerminal := false
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
@@ -777,14 +906,18 @@ func NodeTerminalWS(c *gin.Context) {
 			rows := intFrom(m["rows"], 24)
 			cols := intFrom(m["cols"], 80)
 			if err := sendWSCommand(nid, "ShellStart", map[string]any{"sessionId": "default", "rows": rows, "cols": cols}); err != nil {
-				_ = conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
+				if err := cli.safeWriteJSON(map[string]any{"type": "error", "message": err.Error()}); err != nil {
+					closeTerminal = true
+				}
 			}
 		case "input":
 			touchTermSession(nid)
 			data, _ := m["data"].(string)
 			if data != "" {
 				if err := sendWSCommand(nid, "ShellInput", map[string]any{"sessionId": "default", "data": data}); err != nil {
-					_ = conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
+					if err := cli.safeWriteJSON(map[string]any{"type": "error", "message": err.Error()}); err != nil {
+						closeTerminal = true
+					}
 				}
 			}
 		case "resize":
@@ -799,7 +932,12 @@ func NodeTerminalWS(c *gin.Context) {
 			_ = sendWSCommand(nid, "ShellStop", map[string]any{"sessionId": "default"})
 			resetTermSession(nid)
 			// notify client that history cleared
-			_ = conn.WriteJSON(map[string]any{"type": "cleared"})
+			if err := cli.safeWriteJSON(map[string]any{"type": "cleared"}); err != nil {
+				closeTerminal = true
+			}
+		}
+		if closeTerminal {
+			break
 		}
 	}
 	// unregister
@@ -1107,18 +1245,21 @@ func broadcastToAdmins(v interface{}) {
 		clients = append(clients, c)
 	}
 	adminMu.RUnlock()
-	// write sequentially; drop broken ones
-	var toDrop []*adminClient
-	for _, ac := range clients {
-		if err := ac.safeWriteMessage(b); err != nil {
-			toDrop = append(toDrop, ac)
+	// Write with bounded parallelism; a slow client can consume at most its own
+	// write deadline instead of serially delaying every other dashboard client.
+	toDrop := writeAdminClientsBoundedParallel(clients, b, getEnvInt("WS_BROADCAST_PARALLELISM", 16), func(ac *adminClient, msg []byte) error {
+		if ac == nil || ac.c == nil {
+			return nil
 		}
-	}
+		return ac.safeWriteMessage(msg)
+	})
 	if len(toDrop) > 0 {
 		adminMu.Lock()
 		for _, ac := range toDrop {
 			delete(adminConns, ac)
-			_ = ac.c.Close()
+			if ac != nil && ac.c != nil {
+				_ = ac.c.Close()
+			}
 		}
 		adminMu.Unlock()
 	}

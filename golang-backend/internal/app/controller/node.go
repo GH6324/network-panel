@@ -1353,6 +1353,7 @@ func NodeDiagStreamPush(c *gin.Context) {
 	if p.Done {
 		msg = "done"
 	}
+	chunkForLog := truncateTailString(p.Chunk, nodeOpLogTextMax)
 	_ = dbpkg.DB.Create(&model.NodeOpLog{
 		TimeMs:    now,
 		NodeID:    node.ID,
@@ -1360,7 +1361,7 @@ func NodeDiagStreamPush(c *gin.Context) {
 		RequestID: p.RequestID,
 		Success:   1,
 		Message:   msg,
-		Stdout:    &p.Chunk,
+		Stdout:    &chunkForLog,
 	}).Error
 
 	var res model.NodeDiagResult
@@ -1369,7 +1370,7 @@ func NodeDiagStreamPush(c *gin.Context) {
 			NodeID:      node.ID,
 			RequestID:   p.RequestID,
 			Type:        kind,
-			Content:     p.Chunk,
+			Content:     truncateTailString(p.Chunk, nodeDiagTextMax),
 			Done:        p.Done,
 			TimeMs:      now,
 			CreatedTime: now,
@@ -1377,14 +1378,7 @@ func NodeDiagStreamPush(c *gin.Context) {
 		}
 		_ = dbpkg.DB.Create(&res).Error
 	} else {
-		content := res.Content
-		if p.Chunk != "" {
-			if content != "" && !strings.HasSuffix(content, "\n") {
-				content += "\n"
-			}
-			content += p.Chunk
-		}
-		res.Content = content
+		res.Content = appendBoundedText(res.Content, p.Chunk, nodeDiagTextMax)
 		res.Done = p.Done
 		res.TimeMs = now
 		res.UpdatedTime = now
@@ -1422,7 +1416,7 @@ func NodeGostConfig(c *gin.Context) {
 		c.JSON(http.StatusOK, response.ErrMsg(errMsg))
 		return
 	}
-	script := "#!/bin/sh\nset +e\nfor p in /etc/gost/gost.json /usr/local/gost/gost.json ./gost.json; do if [ -f \"$p\" ]; then echo \"PATH:$p\"; cat \"$p\"; exit 0; fi; done; echo 'PATH:NOT_FOUND'; exit 0\n"
+	script := buildGostConfigReadScript(gostConfigReadMaxBytes)
 	req := map[string]any{"requestId": RandUUID(), "timeoutSec": 8, "content": script}
 	if res, ok := RequestOp(node.ID, "RunScript", req, 10*time.Second); ok {
 		msg := "ok"
@@ -1740,7 +1734,7 @@ func DiagBacktraceScript(c *gin.Context) {
 			resp.Body.Close()
 			continue
 		}
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 		resp.Body.Close()
 		if err != nil || len(body) == 0 {
 			lastErr = "empty body"

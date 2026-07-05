@@ -17,6 +17,8 @@ import (
 	"network-panel/golang-backend/internal/app/model"
 	appver "network-panel/golang-backend/internal/app/version"
 	dbpkg "network-panel/golang-backend/internal/db"
+
+	"gorm.io/gorm"
 )
 
 func Start() {
@@ -150,7 +152,7 @@ func fetchExternalIP() string {
 	client := &http.Client{Timeout: 3 * time.Second}
 	if resp, err := client.Get(url); err == nil {
 		defer resp.Body.Close()
-		if b, err2 := io.ReadAll(resp.Body); err2 == nil {
+		if b, err2 := io.ReadAll(io.LimitReader(resp.Body, 4096)); err2 == nil {
 			ip := strings.TrimSpace(string(b))
 			if ip != "" {
 				return ip
@@ -191,22 +193,56 @@ func postHeartbeat(endpoint, kind, uid, version, osName, arch string, createdAt 
 	return nil
 }
 
-// pruneOldData cleans time-series tables older than 3 days
+// pruneOldData cleans time-series tables older than the configured retention window.
 func pruneOldData() {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
-	cutoff := func() int64 { return time.Now().Add(-time.Duration(getPruneWindowHours()) * time.Hour).UnixMilli() }
-	clean := func(table any, col string) {
-		_ = dbpkg.DB.Where(col+" < ?", cutoff()).Delete(table).Error
-	}
 	for {
-		clean(&model.NodeOpLog{}, "time_ms")
-		clean(&model.NodeAnyTLSCertLog{}, "time_ms")
-		clean(&model.NodeProbeResult{}, "time_ms")
-		clean(&model.NodeSysInfo{}, "time_ms")
-		clean(&model.FlowTimeseries{}, "time_ms")
-		clean(&model.NQResult{}, "time_ms")
+		cutoff := time.Now().Add(-time.Duration(getPruneWindowHours()) * time.Hour).UnixMilli()
+		pruneOldDataOnce(dbpkg.DB, cutoff, getPruneRowsPerNode())
 		<-ticker.C
+	}
+}
+
+func pruneOldDataOnce(db *gorm.DB, cutoffMs int64, rowsPerNode int) {
+	cleanTime := func(table any, col string) {
+		_ = db.Where(col+" < ?", cutoffMs).Delete(table).Error
+	}
+	cleanTime(&model.NodeOpLog{}, "time_ms")
+	cleanTime(&model.NodeAnyTLSCertLog{}, "time_ms")
+	cleanTime(&model.NodeProbeResult{}, "time_ms")
+	cleanTime(&model.NodeSysInfo{}, "time_ms")
+	cleanTime(&model.FlowTimeseries{}, "time_ms")
+	cleanTime(&model.NQResult{}, "time_ms")
+	cleanTime(&model.EasyTierResult{}, "time_ms")
+	cleanTime(&model.NodeDiagResult{}, "time_ms")
+
+	if rowsPerNode <= 0 {
+		return
+	}
+	pruneByNodeLimit(db, &model.NodeOpLog{}, rowsPerNode)
+	pruneByNodeLimit(db, &model.NodeAnyTLSCertLog{}, rowsPerNode)
+	pruneByNodeLimit(db, &model.NodeProbeResult{}, rowsPerNode)
+	pruneByNodeLimit(db, &model.NodeSysInfo{}, rowsPerNode)
+	pruneByNodeLimit(db, &model.NQResult{}, rowsPerNode)
+	pruneByNodeLimit(db, &model.EasyTierResult{}, rowsPerNode)
+	pruneByNodeLimit(db, &model.NodeDiagResult{}, rowsPerNode)
+}
+
+func pruneByNodeLimit(db *gorm.DB, table any, limit int) {
+	var nodeIDs []int64
+	if err := db.Model(table).Distinct("node_id").Pluck("node_id", &nodeIDs).Error; err != nil {
+		return
+	}
+	for _, nodeID := range nodeIDs {
+		var keepIDs []int64
+		if err := db.Model(table).Where("node_id = ?", nodeID).Order("time_ms desc, id desc").Limit(limit).Pluck("id", &keepIDs).Error; err != nil {
+			continue
+		}
+		if len(keepIDs) < limit {
+			continue
+		}
+		_ = db.Where("node_id = ? AND id NOT IN ?", nodeID, keepIDs).Delete(table).Error
 	}
 }
 
@@ -233,4 +269,19 @@ func getPruneWindowHours() int {
 		}
 	}
 	return 72
+}
+
+func getPruneRowsPerNode() int {
+	if v := strings.TrimSpace(os.Getenv("PRUNE_ROWS_PER_NODE")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	var cfg model.ViteConfig
+	if err := dbpkg.DB.Where("name = ?", "prune_rows_per_node").First(&cfg).Error; err == nil {
+		if n, err := strconv.Atoi(strings.TrimSpace(cfg.Value)); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 500
 }

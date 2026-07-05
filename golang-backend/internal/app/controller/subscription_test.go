@@ -75,6 +75,24 @@ func TestBuildAnyTLSURI_AliasParams(t *testing.T) {
 	}
 }
 
+func TestBuildAnyTLSURI_CertSHA256PinCanonicalized(t *testing.T) {
+	it := subProxy{
+		Name:   "node-a",
+		Server: "example.com",
+		Port:   443,
+	}
+	params := map[string]interface{}{
+		"sni":              "www.apple.com",
+		"fingerprint":      "SHA256:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+		"skip-cert-verify": false,
+	}
+	got := buildAnyTLSURI("u1:Wangzai007..@@", it, params)
+	want := "cert-sha256=aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+	if !strings.Contains(got, want) {
+		t.Fatalf("missing canonical cert-sha256 pin %q in %s", want, got)
+	}
+}
+
 func TestBuildSurgeAnyTLSLine_StripPrefixAndAppendEgress(t *testing.T) {
 	params := map[string]interface{}{
 		"sni":              "www.apple.com",
@@ -288,7 +306,10 @@ func TestSubscriptionItems_AnyTLSExpandByForwardEgresses(t *testing.T) {
 		&model.Node{},
 		&model.Tunnel{},
 		&model.Forward{},
+		&model.ViteConfig{},
+		&model.ExitSetting{},
 		&model.AnyTLSSetting{},
+		&model.AnyTLSPortEgress{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -407,6 +428,8 @@ func TestSubscriptionItems_AnyTLSPortMappingEgressFallback(t *testing.T) {
 		&model.Node{},
 		&model.Tunnel{},
 		&model.Forward{},
+		&model.ViteConfig{},
+		&model.ExitSetting{},
 		&model.AnyTLSSetting{},
 		&model.AnyTLSPortEgress{},
 	); err != nil {

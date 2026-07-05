@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -19,6 +20,11 @@ type logCaptureSession struct {
 	offset    int64
 	target    string
 }
+
+const (
+	defaultLogCaptureMaxBytes = 64 * 1024
+	defaultJournalMaxLines    = 2000
+)
 
 var (
 	logCaptureMu sync.Mutex
@@ -175,12 +181,16 @@ func readJournalSince(t time.Time, target string, unit string) (string, error) {
 			unit = "gost"
 		}
 	}
-	cmd := exec.Command("journalctl", "-u", unit, "--since", fmt.Sprintf("@%d", sec), "--no-pager")
-	out, err := cmd.CombinedOutput()
+	cmd := exec.Command("journalctl", journalctlArgs(unit, sec)...)
+	out, err := runCommandCombinedLimited(cmd, logCaptureMaxBytes())
 	if err != nil {
 		return "", fmt.Errorf("journalctl error: %v", err)
 	}
-	return string(out), nil
+	return out, nil
+}
+
+func journalctlArgs(unit string, sinceUnix int64) []string {
+	return []string{"-u", unit, "--since", fmt.Sprintf("@%d", sinceUnix), "--no-pager", "--lines", fmt.Sprintf("%d", journalMaxLines()), "--output", "short-iso"}
 }
 
 func readJournalWithFallback(t time.Time, target string) (string, bool) {
@@ -256,14 +266,103 @@ func readFileFromOffset(path string, offset int64) (string, error) {
 		return "", err
 	}
 	defer f.Close()
-	if offset > 0 {
+	maxBytes := logCaptureMaxBytes()
+	truncated := false
+	if st, err := f.Stat(); err == nil {
+		start := offset
+		if start < 0 {
+			start = 0
+		}
+		if st.Size() > start+maxBytes {
+			start = st.Size() - maxBytes
+			truncated = true
+		}
+		if start > 0 {
+			if _, err := f.Seek(start, io.SeekStart); err != nil {
+				return "", err
+			}
+		}
+	} else if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
 			return "", err
 		}
 	}
 	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, f); err != nil && !errors.Is(err, io.EOF) {
+	if truncated {
+		buf.WriteString(fmt.Sprintf("[truncated: kept last %d bytes]\n", maxBytes))
+	}
+	if _, err := io.CopyN(&buf, f, maxBytes+1); err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
-	return buf.String(), nil
+	out := buf.String()
+	return truncateLogCaptureString(out, int(maxBytes)), nil
+}
+
+func logCaptureMaxBytes() int64 {
+	if v := os.Getenv("AGENT_LOG_CAPTURE_MAX_BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return int64(n)
+		}
+	}
+	return defaultLogCaptureMaxBytes
+}
+
+func journalMaxLines() int {
+	if v := os.Getenv("AGENT_JOURNAL_MAX_LINES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultJournalMaxLines
+}
+
+type limitedBuffer struct {
+	buf       bytes.Buffer
+	max       int
+	truncated bool
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.max <= 0 {
+		return len(p), nil
+	}
+	remain := b.max - b.buf.Len()
+	if remain > 0 {
+		if len(p) <= remain {
+			_, _ = b.buf.Write(p)
+		} else {
+			_, _ = b.buf.Write(p[:remain])
+			b.truncated = true
+		}
+	} else if len(p) > 0 {
+		b.truncated = true
+	}
+	return len(p), nil
+}
+
+func (b *limitedBuffer) String() string {
+	out := b.buf.String()
+	if b.truncated {
+		out += fmt.Sprintf("\n[truncated: kept first %d bytes]", b.max)
+	}
+	return out
+}
+
+func runCommandCombinedLimited(cmd *exec.Cmd, maxBytes int64) (string, error) {
+	lb := &limitedBuffer{max: int(maxBytes)}
+	cmd.Stdout = lb
+	cmd.Stderr = lb
+	err := cmd.Run()
+	return lb.String(), err
+}
+
+func truncateLogCaptureString(s string, max int) string {
+	if max <= 0 || len(s) <= max+256 {
+		return s
+	}
+	marker := fmt.Sprintf("[truncated: kept last %d of %d bytes]\n", max, len(s))
+	if len(marker) >= max {
+		return marker
+	}
+	return marker + s[len(s)-(max-len(marker)):]
 }

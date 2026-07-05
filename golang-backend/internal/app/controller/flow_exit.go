@@ -34,7 +34,11 @@ func FlowExitUpload(c *gin.Context) {
 		return
 	}
 	// read raw body once; support observer events format
-	body, _ := io.ReadAll(c.Request.Body)
+	body, _ := io.ReadAll(io.LimitReader(c.Request.Body, 1024*1024+1))
+	if len(body) > 1024*1024 {
+		c.String(http.StatusOK, "ok")
+		return
+	}
 	type obsStats struct {
 		TotalConns   int   `json:"totalConns"`
 		CurrentConns int   `json:"currentConns"`
@@ -82,11 +86,11 @@ func FlowExitUpload(c *gin.Context) {
 	if ur.RowsAffected == 0 {
 		status := 1
 		_ = dbpkg.DB.Create(&model.UserNode{
-			UserID:        uid,
-			NodeID:        node.ID,
-			InFlow:        inBytes,
-			OutFlow:       outBytes,
-			Status:        status,
+			UserID:  uid,
+			NodeID:  node.ID,
+			InFlow:  inBytes,
+			OutFlow: outBytes,
+			Status:  status,
 		}).Error
 	}
 	// statistics_flow (hourly bucket)

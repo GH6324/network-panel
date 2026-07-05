@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -388,7 +389,7 @@ func fetchLatestRelease() (*ghRelease, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(b))
 	}
 	var rel ghRelease
@@ -434,6 +435,44 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func getEnvInt64(key string, def int64) int64 {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+func maxUpdateDownloadBytes() int64 {
+	return getEnvInt64("UPDATE_DOWNLOAD_MAX_BYTES", 512*1024*1024)
+}
+
+func maxUnzipEntryBytes() int64 {
+	return getEnvInt64("UPDATE_UNZIP_MAX_ENTRY_BYTES", 256*1024*1024)
+}
+
+func checkHTTPContentLength(resp *http.Response, maxBytes int64) error {
+	if maxBytes > 0 && resp.ContentLength > maxBytes {
+		return fmt.Errorf("response content-length %d exceeds max download size %d", resp.ContentLength, maxBytes)
+	}
+	return nil
+}
+
+func copyLimited(dst io.Writer, src io.Reader, maxBytes int64, label string) (int64, error) {
+	if maxBytes <= 0 {
+		return io.Copy(dst, src)
+	}
+	n, err := io.Copy(dst, io.LimitReader(src, maxBytes+1))
+	if err != nil {
+		return n, err
+	}
+	if n > maxBytes {
+		return n, fmt.Errorf("%s exceeds max download size %d", label, maxBytes)
+	}
+	return n, nil
+}
+
 func downloadToTmpLogged(url string, logf func(string, ...any)) (string, error) {
 	start := time.Now()
 	logf("GET %s -> 临时文件 开始", url)
@@ -450,14 +489,19 @@ func downloadToTmpLogged(url string, logf func(string, ...any)) (string, error) 
 		logf("GET %s 失败: %v", url, err)
 		return "", err
 	}
+	if err := checkHTTPContentLength(resp, maxUpdateDownloadBytes()); err != nil {
+		logf("GET %s 失败: %v", url, err)
+		return "", err
+	}
 	f, err := os.CreateTemp("", "np_dl_")
 	if err != nil {
 		logf("创建临时文件失败: %v", err)
 		return "", err
 	}
 	cw := &countingWriter{}
-	if _, err := io.Copy(io.MultiWriter(f, cw), resp.Body); err != nil {
+	if _, err := copyLimited(io.MultiWriter(f, cw), resp.Body, maxUpdateDownloadBytes(), "download body"); err != nil {
 		f.Close()
+		_ = os.Remove(f.Name())
 		logf("GET %s 传输失败: %v", url, err)
 		return "", err
 	}
@@ -482,6 +526,10 @@ func downloadToPathLogged(url, dst string, mode os.FileMode, logf func(string, .
 		logf("GET %s 失败: %v", url, err)
 		return err
 	}
+	if err := checkHTTPContentLength(resp, maxUpdateDownloadBytes()); err != nil {
+		logf("GET %s 失败: %v", url, err)
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		logf("创建目录失败 %s: %v", filepath.Dir(dst), err)
 		return err
@@ -493,8 +541,9 @@ func downloadToPathLogged(url, dst string, mode os.FileMode, logf func(string, .
 		return err
 	}
 	cw := &countingWriter{}
-	if _, err := io.Copy(io.MultiWriter(f, cw), resp.Body); err != nil {
+	if _, err := copyLimited(io.MultiWriter(f, cw), resp.Body, maxUpdateDownloadBytes(), "download body"); err != nil {
 		f.Close()
+		_ = os.Remove(tmp)
 		logf("GET %s 传输失败: %v", url, err)
 		return err
 	}
@@ -520,15 +569,19 @@ func downloadToTmp(url string) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	if err := checkHTTPContentLength(resp, maxUpdateDownloadBytes()); err != nil {
+		return "", err
 	}
 	f, err := os.CreateTemp("", "np_dl_")
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	if _, err := copyLimited(f, resp.Body, maxUpdateDownloadBytes(), "download body"); err != nil {
+		_ = os.Remove(f.Name())
 		return "", err
 	}
 	return f.Name(), nil
@@ -542,8 +595,11 @@ func downloadToPath(url, dst string, mode os.FileMode) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	if err := checkHTTPContentLength(resp, maxUpdateDownloadBytes()); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
@@ -553,8 +609,9 @@ func downloadToPath(url, dst string, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	if _, err := copyLimited(f, resp.Body, maxUpdateDownloadBytes(), "download body"); err != nil {
 		f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	f.Close()
@@ -580,6 +637,9 @@ func unzipTo(zipPath, destDir string) error {
 			_ = os.MkdirAll(rp, 0o755)
 			continue
 		}
+		if max := maxUnzipEntryBytes(); max > 0 && int64(f.UncompressedSize64) > max {
+			return fmt.Errorf("zip entry %s size %d exceeds max unzip entry size %d", f.Name, f.UncompressedSize64, max)
+		}
 		if err := os.MkdirAll(filepath.Dir(rp), 0o755); err != nil {
 			return err
 		}
@@ -593,9 +653,10 @@ func unzipTo(zipPath, destDir string) error {
 			rc.Close()
 			return err
 		}
-		if _, err := io.Copy(out, rc); err != nil {
+		if _, err := copyLimited(out, rc, maxUnzipEntryBytes(), "zip entry "+f.Name); err != nil {
 			out.Close()
 			rc.Close()
+			_ = os.Remove(tmp)
 			return err
 		}
 		out.Close()

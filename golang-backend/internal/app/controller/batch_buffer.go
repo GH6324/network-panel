@@ -25,8 +25,8 @@ var (
 	bufProbe   []model.NodeProbeResult
 
 	// latest node runtime (interfaces) by node; only latest value is kept
-	bufRuntimeMu sync.Mutex
-	bufRuntime   = map[int64]*model.NodeRuntime{}
+	bufRuntimeMu   sync.Mutex
+	bufRuntime     = map[int64]*model.NodeRuntime{}
 	runtimeCacheMu sync.Mutex
 	runtimeCache   = map[int64]model.NodeRuntime{}
 
@@ -261,6 +261,9 @@ func readBufferedProbes(nodeID int64, from int64) []model.NodeProbeResult {
 
 // Enqueue op log
 func enqueueOpLog(rec model.NodeOpLog) {
+	rec.Message = truncateTailString(rec.Message, nodeOpLogTextMax)
+	rec.Stdout = truncateStringPtr(rec.Stdout, nodeOpLogTextMax)
+	rec.Stderr = truncateStringPtr(rec.Stderr, nodeOpLogTextMax)
 	bufOpMu.Lock()
 	bufOp = append(bufOp, rec)
 	if maxOp > 0 && len(bufOp) > maxOp {

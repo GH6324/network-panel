@@ -21,12 +21,12 @@ import (
 
 // Keys in ViteConfig
 const (
-	etEnabledKey = "easytier_enabled"
-	etSecretKey  = "easytier_secret"
-	etMasterKey  = "easytier_master"
-	etNodesKey   = "easytier_nodes"
-	etAutoKey    = "easytier_auto_join"
-	panelHostCacheKey = "panel_host_cache"
+	etEnabledKey         = "easytier_enabled"
+	etSecretKey          = "easytier_secret"
+	etMasterKey          = "easytier_master"
+	etNodesKey           = "easytier_nodes"
+	etAutoKey            = "easytier_auto_join"
+	panelHostCacheKey    = "panel_host_cache"
 	etStatusNotInstalled = "not_installed"
 	etStatusDownloading  = "downloading"
 	etStatusInstalling   = "installing"
@@ -999,7 +999,7 @@ func fetchEasyTierLatestVersion() string {
 		if err != nil {
 			continue
 		}
-		b, _ := io.ReadAll(res.Body)
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 64*1024))
 		res.Body.Close()
 		if res.StatusCode/100 != 2 {
 			continue
@@ -1350,8 +1350,8 @@ func writeEasyTierConfig(nodeID int64, conf string, reqID string) (bool, string)
 		return true, ""
 	}
 	if ok, msg := requestWithRetrySuccess(nodeID, "RunScript", map[string]any{
-		"requestId": RandUUID(),
-		"content":   buildEasyTierConfigScript(conf),
+		"requestId":  RandUUID(),
+		"content":    buildEasyTierConfigScript(conf),
 		"timeoutSec": 20,
 	}, 30*time.Second, 1); ok {
 		logEasyTierConfig(nodeID, reqID, conf)
@@ -2333,7 +2333,7 @@ func EasyTierLogStream(c *gin.Context) {
 		}
 	}
 }
-func RandUUID32() string              { v := RandUUID(); sum := md5.Sum([]byte(v)); return fmt.Sprintf("%x", sum) }
+func RandUUID32() string { v := RandUUID(); sum := md5.Sum([]byte(v)); return fmt.Sprintf("%x", sum) }
 
 // ipv4Tail returns the last numeric segment for template placeholder.
 func ipv4Tail(v string, nodeID int64) string {

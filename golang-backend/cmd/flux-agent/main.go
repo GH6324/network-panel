@@ -53,9 +53,11 @@ var (
 	gostAPIVerboseBody int32 = 0
 	gostAPIBodyCap     int32 = 2048
 	// Sample high-frequency successful API logs (not errors).
-	gostAPISuccessLogEvery int32  = 12
-	gostAPIOpLogOK         int32  = 0
-	gostSvcGetRespCount    uint64 = 0
+	gostAPISuccessLogEvery  int32  = 12
+	gostAPIOpLogOK          int32  = 0
+	gostSvcGetRespCount     uint64 = 0
+	gostAPIServicesMaxItems int32  = 4096
+	gostConfigMaxBytes      int64  = 4 * 1024 * 1024
 	// Unknown message payload logging cap to avoid memory/log spikes.
 	unknownMsgPayloadCap int32 = 512
 )
@@ -97,7 +99,7 @@ func wsWriteControl(c *websocket.Conn, mt int, data []byte, deadline time.Time) 
 
 // versionBase is the agent semantic version (without role prefix).
 // final reported version is: go-agent-<versionBase> or go-agent2-<versionBase>
-var versionBase = "2.0.0.27"
+var versionBase = "2.0.0.28"
 var version = ""      // computed in main()
 var apiBootDone int32 // 0=not attempted, 1=attempted
 var apiUse int32      // 1=Web API usable
@@ -280,7 +282,7 @@ func fetchExternalIP() string {
 	client := &http.Client{Timeout: 3 * time.Second}
 	if resp, err := client.Get(url); err == nil {
 		defer resp.Body.Close()
-		if b, err2 := io.ReadAll(resp.Body); err2 == nil {
+		if b, err2 := io.ReadAll(io.LimitReader(resp.Body, 4096)); err2 == nil {
 			ip := strings.TrimSpace(string(b))
 			if ip != "" {
 				return ip
@@ -428,6 +430,7 @@ func main() {
 	}
 	tuneRuntimeMemory()
 	startPprofServer()
+	go ensureNodeJournalLimits()
 
 	addr := getenv("ADDR", *flagAddr)
 	secret := getenv("SECRET", *flagSecret)
@@ -460,6 +463,16 @@ func main() {
 	if v := strings.TrimSpace(getenv("AGENT_GOST_API_SUCCESS_LOG_EVERY", "")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			atomic.StoreInt32(&gostAPISuccessLogEvery, int32(n))
+		}
+	}
+	if v := strings.TrimSpace(getenv("AGENT_GOST_API_SERVICES_MAX_ITEMS", "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			atomic.StoreInt32(&gostAPIServicesMaxItems, int32(n))
+		}
+	}
+	if v := strings.TrimSpace(getenv("AGENT_GOST_CONFIG_MAX_BYTES", "")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			atomic.StoreInt64(&gostConfigMaxBytes, n)
 		}
 	}
 	if envBool("AGENT_GOST_API_OPLOG_OK", false) {
@@ -1748,7 +1761,7 @@ func reconcile(addr, secret, scheme string) {
 	// read local gost.json service names and panel-managed flag
 	present := map[string]struct{}{}
 	managed := map[string]bool{}
-	if b, err := os.ReadFile(resolveGostConfigPathForRead()); err == nil {
+	if b, err := readFileLimited(resolveGostConfigPathForRead(), maxGostConfigFileBytes()); err == nil {
 		var m map[string]any
 		if json.Unmarshal(b, &m) == nil {
 			if arr, ok := m["services"].([]any); ok {
@@ -2174,11 +2187,11 @@ func verifyGostAPIBindLoopbackOnly(port int) (bool, string) {
 	// 1) prefer ss on linux
 	if _, err := exec.LookPath("ss"); err == nil {
 		cmd := exec.Command("ss", "-ltnH")
-		out, err := cmd.CombinedOutput()
+		out, err := runCommandCombinedLimited(cmd, 64*1024)
 		if err == nil {
 			found := 0
 			var bad []string
-			sc := bufio.NewScanner(bytes.NewReader(out))
+			sc := bufio.NewScanner(strings.NewReader(out))
 			for sc.Scan() {
 				line := strings.TrimSpace(sc.Text())
 				if line == "" {
@@ -2210,11 +2223,11 @@ func verifyGostAPIBindLoopbackOnly(port int) (bool, string) {
 	// 2) fallback to lsof heuristic
 	if _, err := exec.LookPath("lsof"); err == nil {
 		cmd := exec.Command("lsof", "-nP", "-iTCP:"+ps, "-sTCP:LISTEN")
-		out, err := cmd.CombinedOutput()
+		out, err := runCommandCombinedLimited(cmd, 64*1024)
 		if err != nil {
 			return false, "lsof exec failed"
 		}
-		txt := string(out)
+		txt := out
 		lines := strings.Split(txt, "\n")
 		found := 0
 		for _, ln := range lines {
@@ -2357,9 +2370,9 @@ func writeGuardedGostAPIPort(port int) {
 
 func runLocalCmd(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := runCommandCombinedLimited(cmd, 32*1024)
 	if err != nil {
-		msg := strings.TrimSpace(string(out))
+		msg := strings.TrimSpace(out)
 		if msg != "" {
 			return fmt.Errorf("%s: %w: %s", name, err, msg)
 		}
@@ -2640,7 +2653,7 @@ func apiDo(method, path string, body []byte) (int, []byte, error) {
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	out, _ := io.ReadAll(resp.Body)
+	out, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	if resp.StatusCode/100 == 2 {
 		atomic.StoreInt32(&apiUse, 1)
 	}
@@ -2697,16 +2710,90 @@ func apiGetServicesList() ([]map[string]any, error) {
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 	atomic.StoreInt32(&apiUse, 1)
-	var list []map[string]any
+	maxItems := maxGostAPIServiceItems()
+	listCap := 128
+	if maxItems > 0 && maxItems < listCap {
+		listCap = maxItems
+	}
+	list := make([]map[string]any, 0, listCap)
 	dec := json.NewDecoder(resp.Body)
-	if err := dec.Decode(&list); err != nil {
+	start, err := dec.Token()
+	if err != nil {
 		return nil, err
+	}
+	if delim, ok := start.(json.Delim); !ok || delim != '[' {
+		return nil, fmt.Errorf("expected services array")
+	}
+	for dec.More() {
+		if maxItems > 0 && len(list) >= maxItems {
+			return nil, fmt.Errorf("too many services: limit %d", maxItems)
+		}
+		var svc map[string]any
+		if err := dec.Decode(&svc); err != nil {
+			return nil, err
+		}
+		list = append(list, svc)
+	}
+	end, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := end.(json.Delim); !ok || delim != ']' {
+		return nil, fmt.Errorf("expected services array end")
 	}
 	every := int(atomic.LoadInt32(&gostAPISuccessLogEvery))
 	if every <= 1 || atomic.AddUint64(&gostSvcGetRespCount, 1)%uint64(every) == 1 {
 		log.Printf("{\"event\":\"gost_api_resp\",\"method\":%q,\"url\":%q,\"status\":%d,\"items\":%d,\"mode\":%q}", "GET", maskURLSecrets(fullURL), resp.StatusCode, len(list), "stream")
 	}
 	return list, nil
+}
+
+func maxGostAPIServiceItems() int {
+	if v := strings.TrimSpace(getenv("AGENT_GOST_API_SERVICES_MAX_ITEMS", "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	n := int(atomic.LoadInt32(&gostAPIServicesMaxItems))
+	if n <= 0 {
+		return 4096
+	}
+	return n
+}
+
+func maxGostConfigFileBytes() int64 {
+	if v := strings.TrimSpace(getenv("AGENT_GOST_CONFIG_MAX_BYTES", "")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	n := atomic.LoadInt64(&gostConfigMaxBytes)
+	if n <= 0 {
+		return 4 * 1024 * 1024
+	}
+	return n
+}
+
+func readFileLimited(path string, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		maxBytes = 4 * 1024 * 1024
+	}
+	if st, err := os.Stat(path); err == nil && st.Size() > maxBytes {
+		return nil, fmt.Errorf("file too large: %d > %d bytes", st.Size(), maxBytes)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf("file too large: over %d bytes", maxBytes)
+	}
+	return b, nil
 }
 
 // apiListServiceNames returns the list of service names from local GOST via Web API.
@@ -3384,9 +3471,10 @@ func getUsedListeningPorts() map[int]bool {
 	}
 	// Fallback: try ss when /proc parsing is unavailable.
 	if p, err := exec.LookPath("ss"); err == nil {
-		out, err := exec.Command(p, "-lntuH").Output()
+		cmd := exec.Command(p, "-lntuH")
+		out, err := runCommandCombinedLimited(cmd, 128*1024)
 		if err == nil {
-			for _, ln := range strings.Split(string(out), "\n") {
+			for _, ln := range strings.Split(out, "\n") {
 				if ln == "" {
 					continue
 				}
@@ -3484,6 +3572,18 @@ func addOrUpdateServices(services []map[string]any, updateOnly bool) error {
 	if !isApiUsable() && !apiBootstrapOnce() {
 		emitOpLog("gost_api_err", "web api unavailable", map[string]any{"message": "GOST Web API 未启用，请在节点上开启后重试"})
 		return fmt.Errorf("gost web api unavailable: please enable on node")
+	}
+	if ports := loadAnyTLSRuntimePortSetForGostGuard(); len(ports) > 0 {
+		filtered, skipped := filterAnyTLSGostLoopServices(services, ports)
+		if len(skipped) > 0 {
+			log.Printf("{\"event\":\"anytls_gost_loop_guard_skip\",\"services\":%q,\"updateOnly\":%v}", skipped, updateOnly)
+			emitOpLog("anytls_gost_loop_guard", "skip AddService/UpdateService on AnyTLS runtime port", map[string]any{"services": skipped, "updateOnly": updateOnly})
+			_ = deleteServices(skipped)
+			services = filtered
+			if len(services) == 0 {
+				return nil
+			}
+		}
 	}
 	if isApiUsable() {
 		// extract chains
@@ -3721,6 +3821,112 @@ func addOrUpdateServices(services []map[string]any, updateOnly bool) error {
 	    return writeGostConfig(cfg)*/
 }
 
+func loadAnyTLSRuntimePortSetForGostGuard() map[int]struct{} {
+	b, err := os.ReadFile(anytlsConfigPath)
+	if err != nil || len(b) == 0 {
+		return nil
+	}
+	var cfg anytlsConfigFile
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		log.Printf("{\"event\":\"anytls_gost_loop_guard_config_err\",\"error\":%q}", err.Error())
+		return nil
+	}
+	ports := map[int]struct{}{}
+	if cfg.Port > 0 {
+		ports[cfg.Port] = struct{}{}
+	}
+	for _, inst := range cfg.Instances {
+		if inst.Port > 0 {
+			ports[inst.Port] = struct{}{}
+		}
+	}
+	return ports
+}
+
+func filterAnyTLSGostLoopServices(services []map[string]any, runtimePorts map[int]struct{}) ([]map[string]any, []string) {
+	if len(services) == 0 || len(runtimePorts) == 0 {
+		return services, nil
+	}
+	filtered := make([]map[string]any, 0, len(services))
+	skippedSet := map[string]struct{}{}
+	for _, svc := range services {
+		if isAnyTLSGostLoopService(svc, runtimePorts) {
+			for _, name := range expandAnyTLSGostGuardNames(mapStringValue(svc, "name")) {
+				skippedSet[name] = struct{}{}
+			}
+			continue
+		}
+		filtered = append(filtered, svc)
+	}
+	if len(skippedSet) == 0 {
+		return filtered, nil
+	}
+	skipped := make([]string, 0, len(skippedSet))
+	for name := range skippedSet {
+		if strings.TrimSpace(name) != "" {
+			skipped = append(skipped, name)
+		}
+	}
+	sort.Strings(skipped)
+	return filtered, skipped
+}
+
+func isAnyTLSGostLoopService(svc map[string]any, runtimePorts map[int]struct{}) bool {
+	if len(runtimePorts) == 0 || !isPanelManagedGostService(svc) {
+		return false
+	}
+	port := parsePort(mapStringValue(svc, "addr"))
+	if port <= 0 {
+		return false
+	}
+	if _, ok := runtimePorts[port]; !ok {
+		return false
+	}
+	if !strings.EqualFold(nestedTypeValue(svc, "handler"), "forward") {
+		return false
+	}
+	lt := strings.ToLower(strings.TrimSpace(nestedTypeValue(svc, "listener")))
+	return lt == "tcp" || lt == "rudp"
+}
+
+func isPanelManagedGostService(svc map[string]any) bool {
+	meta, _ := svc["metadata"].(map[string]any)
+	if meta == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(meta["managedBy"])), "network-panel")
+}
+
+func nestedTypeValue(svc map[string]any, key string) string {
+	raw := svc[key]
+	if s, ok := raw.(string); ok {
+		return s
+	}
+	if m, ok := raw.(map[string]any); ok {
+		return strings.TrimSpace(fmt.Sprint(m["type"]))
+	}
+	return ""
+}
+
+func mapStringValue(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(m[key]))
+}
+
+func expandAnyTLSGostGuardNames(name string) []string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	base := strings.TrimSuffix(name, "_rudp")
+	if base == "" || base == name && strings.HasSuffix(name, "_rudp") {
+		return []string{name}
+	}
+	return []string{base, base + "_rudp"}
+}
+
 func deleteServices(names []string) error {
 	if len(names) == 0 {
 		return nil
@@ -3851,7 +4057,8 @@ func runICMP(host string, count, timeoutMs int) (avg int, loss int) {
 	if strings.Contains(host, ":") { // ipv6
 		args = []string{"-6", "-c", fmt.Sprintf("%d", count), "-W", timeoutS, host}
 	}
-	out, err := exec.Command(cmdName, args...).CombinedOutput()
+	cmd := exec.Command(cmdName, args...)
+	out, err := runCommandCombinedLimited(cmd, 32*1024)
 	if err != nil {
 		return 0, 100
 	}
@@ -3888,7 +4095,8 @@ func pickPort() int {
 }
 
 func startIperf3Server(port int) bool {
-	_, err := exec.Command("iperf3", "-s", "-D", "-p", fmt.Sprintf("%d", port)).CombinedOutput()
+	cmd := exec.Command("iperf3", "-s", "-D", "-p", fmt.Sprintf("%d", port))
+	_, err := runCommandCombinedLimited(cmd, 32*1024)
 	return err == nil
 }
 
@@ -3900,12 +4108,13 @@ func runIperf3Client(host string, port, duration int, reverse bool) float64 {
 	if reverse {
 		args = append(args, "-R")
 	}
-	out, err := exec.Command("iperf3", args...).CombinedOutput()
+	cmd := exec.Command("iperf3", args...)
+	out, err := runCommandCombinedLimited(cmd, 256*1024)
 	if err != nil {
 		return 0
 	}
 	var m map[string]any
-	if json.Unmarshal(out, &m) != nil {
+	if json.Unmarshal([]byte(out), &m) != nil {
 		return 0
 	}
 	end, _ := m["end"].(map[string]any)
@@ -3932,9 +4141,10 @@ func runIperf3ClientVerbose(host string, port, duration int, reverse bool) (floa
 	if reverse {
 		args = append(args, "-R")
 	}
-	out, err := exec.Command("iperf3", args...).CombinedOutput()
+	cmd := exec.Command("iperf3", args...)
+	out, err := runCommandCombinedLimited(cmd, 256*1024)
 	if err != nil {
-		msg := string(out)
+		msg := out
 		if len(msg) > 240 {
 			msg = msg[:240]
 		}
@@ -3944,8 +4154,8 @@ func runIperf3ClientVerbose(host string, port, duration int, reverse bool) (floa
 		return 0, msg
 	}
 	var m map[string]any
-	if json.Unmarshal(out, &m) != nil {
-		msg := string(out)
+	if json.Unmarshal([]byte(out), &m) != nil {
+		msg := out
 		if len(msg) > 240 {
 			msg = msg[:240]
 		}
@@ -3983,7 +4193,7 @@ func httpPostJSON(url string, body any) (int, []byte, error) {
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	out, _ := io.ReadAll(resp.Body)
+	out, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	return resp.StatusCode, out, nil
 }
 
@@ -4234,8 +4444,39 @@ WantedBy=multi-user.target
 `, name, name, execPath)
 	// write service file (best-effort)
 	_ = os.WriteFile(svc, []byte(content), 0644)
+	ensureServiceLogDropIn(name)
 	_ = exec.Command("systemctl", "daemon-reload").Run()
 	_ = exec.Command("systemctl", "enable", name).Run()
+}
+
+func ensureServiceLogDropIn(name string) {
+	if _, err := exec.LookPath("systemctl"); err != nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	dir := "/etc/systemd/system/" + name + ".service.d"
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
+	content := `[Service]
+# network-panel: bound noisy node logs to avoid journald memory/disk spikes.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+`
+	_ = os.WriteFile(filepath.Join(dir, "90-network-panel-log-limit.conf"), []byte(content), 0644)
+}
+
+func ensureNodeJournalLimits() {
+	if _, err := exec.LookPath("journalctl"); err == nil {
+		_ = exec.Command("journalctl", "--vacuum-size=200M").Run()
+		_ = exec.Command("journalctl", "--vacuum-time=7d").Run()
+	}
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return
+	}
+	ensureServiceLogDropIn("flux-agent")
+	ensureServiceLogDropIn("flux-agent2")
+	ensureServiceLogDropIn("gost")
+	_ = exec.Command("systemctl", "daemon-reload").Run()
 }
 
 // ---- Generic Ops ----
@@ -4289,14 +4530,14 @@ func runScript(req map[string]any) map[string]any {
 		cmd = exec.CommandContext(ctx, cmdPath, scriptPath)
 	}
 	log.Printf("{\"event\":\"run_script_exec\",\"cmd\":[%q,%q],\"timeoutSec\":%d}", cmdPath, scriptPath, timeoutSec)
-	out, e := cmd.CombinedOutput()
+	out, e := runCommandCombinedLimited(cmd, runScriptOutputMaxBytes())
 	if ctx.Err() == context.DeadlineExceeded {
 		return map[string]any{"success": false, "message": "timeout"}
 	}
 	if e != nil {
-		return map[string]any{"success": false, "message": e.Error(), "stderr": string(out)}
+		return map[string]any{"success": false, "message": e.Error(), "stderr": out}
 	}
-	return map[string]any{"success": true, "message": "ok", "stdout": string(out)}
+	return map[string]any{"success": true, "message": "ok", "stdout": out}
 }
 
 // runStreamScript executes a script and streams stdout/stderr chunks to endpoint every ~3s
@@ -4383,7 +4624,7 @@ func streamCmd(cmd *exec.Cmd, endpoint, secret, reqID, kind string) {
 			if !ok {
 				ch = nil
 			} else {
-				buf.WriteString(ck.s)
+				appendBoundedBuilderTail(&buf, ck.s, streamScriptChunkMaxBytes())
 			}
 		case <-ticker.C:
 			flush(false, nil)
@@ -4618,6 +4859,57 @@ func firstN(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+func runScriptOutputMaxBytes() int64 {
+	if v := strings.TrimSpace(getenv("AGENT_RUN_SCRIPT_OUTPUT_MAX_BYTES", "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return int64(n)
+		}
+	}
+	return 128 * 1024
+}
+
+func runScriptURLMaxBytes() int64 {
+	if v := strings.TrimSpace(getenv("AGENT_RUN_SCRIPT_URL_MAX_BYTES", "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return int64(n)
+		}
+	}
+	return 512 * 1024
+}
+
+func streamScriptChunkMaxBytes() int {
+	if v := strings.TrimSpace(getenv("AGENT_STREAM_SCRIPT_CHUNK_MAX_BYTES", "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 64 * 1024
+}
+
+func appendBoundedBuilderTail(b *strings.Builder, s string, max int) {
+	if max <= 0 {
+		return
+	}
+	if b.Len()+len(s) <= max {
+		b.WriteString(s)
+		return
+	}
+	marker := fmt.Sprintf("\n[truncated: stream chunk kept last %d bytes]\n", max)
+	keep := max - len(marker)
+	if keep <= 0 {
+		b.Reset()
+		b.WriteString(firstN(marker, max))
+		return
+	}
+	combined := b.String() + s
+	if len(combined) > keep {
+		combined = combined[len(combined)-keep:]
+	}
+	b.Reset()
+	b.WriteString(marker)
+	b.WriteString(combined)
 }
 
 func hasShebang(path string) bool {
@@ -4875,7 +5167,15 @@ func fetchURL(target string) ([]byte, error) {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("status %s body=%q", resp.Status, string(b))
 	}
-	return io.ReadAll(resp.Body)
+	maxBytes := runScriptURLMaxBytes()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf("response too large: limit=%d bytes", maxBytes)
+	}
+	return b, nil
 }
 
 // validateBinary performs a minimal ELF validation and arch check to avoid
@@ -4924,12 +5224,12 @@ func validateBinaryRunnable(path string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, bin, "-v")
-		out, err := cmd.CombinedOutput()
+		out, err := runCommandCombinedLimited(cmd, 4*1024)
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("binary smoke test timeout")
 		}
 		if err != nil {
-			msg := strings.TrimSpace(string(out))
+			msg := strings.TrimSpace(out)
 			if len(msg) > 240 {
 				msg = msg[:240]
 			}

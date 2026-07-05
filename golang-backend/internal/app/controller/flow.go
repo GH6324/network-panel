@@ -33,7 +33,11 @@ func FlowUpload(c *gin.Context) {
 	}
 
 	// read raw body once; support old and new formats
-	body, _ := io.ReadAll(c.Request.Body)
+	body, _ := io.ReadAll(io.LimitReader(c.Request.Body, 1024*1024+1))
+	if len(body) > 1024*1024 {
+		c.String(http.StatusOK, "ok")
+		return
+	}
 
 	// Try new observer events format first
 	type obsStats struct {

@@ -595,11 +595,7 @@ func startAnyTLS(cfg anytlsConfig) error {
 	default:
 		fallbackMode = "http"
 	}
-	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{*cert},
-		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"h2", "http/1.1"},
-	}
+	tlsCfg := newAnyTLSServerTLSConfig(*cert)
 	var helloSeen uint64
 	tlsCfg.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 		n := atomic.AddUint64(&helloSeen, 1)
@@ -663,6 +659,28 @@ func startAnyTLS(cfg anytlsConfig) error {
 		"handshakeTimeoutSec": int(tuning.handshakeTO / time.Second),
 	})
 	return nil
+}
+
+func newAnyTLSServerTLSConfig(cert tls.Certificate) *tls.Config {
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"h2", "http/1.1"},
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		},
+		CurvePreferences: []tls.CurveID{
+			tls.X25519,
+			tls.CurveP256,
+			tls.CurveP384,
+		},
+		SessionTicketsDisabled: true,
+	}
 }
 
 func listenAnyTLSSockets(port int) ([]net.Listener, error) {

@@ -212,4 +212,5 @@ func pushAnyTLSConfigToNode(nodeID int64) {
 		req := buildReq(pm.Port, pm.ExitIP, allowFallback)
 		_, _ = RequestOp(nodeID, "SetAnyTLS", req, 10*time.Second)
 	}
+	cleanupAnyTLSGostLoopServices(nodeID)
 }

@@ -3529,6 +3529,7 @@ func prepareForwardAnyTLSInstance(t *model.Tunnel, f *model.Forward, requestedOu
 		return fmt.Errorf("出口节点地址无效")
 	}
 	f.RemoteAddr = safeHostPort(host, selected)
+	cleanupAnyTLSGostLoopServices(outNodeID)
 	return nil
 }
 

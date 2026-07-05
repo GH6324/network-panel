@@ -252,6 +252,8 @@ tmp-*/
 .release-static/
 dist/releases/
 flux-agent
+!golang-backend/cmd/flux-agent/
+!golang-backend/cmd/flux-agent/*_test.go
 flux-agent2
 server
 network-panel-server
