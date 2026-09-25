@@ -6,6 +6,9 @@ import { Select, SelectItem } from "@heroui/select";
 import { toast } from "react-hot-toast";
 import QRCode from "qrcode";
 
+const shadowrocketRulesUrl =
+  "https://raw.githubusercontent.com/LingJingMaster/Shadowrocket-Rules/refs/heads/main/Shadowrocket.conf";
+
 const buildBaseUrl = () => {
   const raw =
     (import.meta as any).env?.VITE_API_BASE || window.location.origin;
@@ -50,8 +53,14 @@ export default function SubscriptionPage() {
       },
       {
         key: "shadowrocket",
-        title: "Shadowrocket 订阅",
-        desc: "iOS 可直接导入订阅链接",
+        title: "Shadowrocket 分流配置",
+        desc: "含当前账户节点与 LingJingMaster 分流规则；在 Shadowrocket 的「配置」中导入并设为使用中",
+        url: `${baseUrl}/api/v1/subscription/shadowrocket?rules=1&token=${encodedToken}`,
+      },
+      {
+        key: "shadowrocket-nodes",
+        title: "Shadowrocket 纯节点订阅（兼容旧版）",
+        desc: "仅包含节点，不含分流规则",
         url: `${baseUrl}/api/v1/subscription/shadowrocket?token=${encodedToken}`,
       },
       {
@@ -153,6 +162,21 @@ export default function SubscriptionPage() {
                 <Input readOnly aria-label={item.title} value={item.url} />
               </div>
             ))}
+            <div className="rounded-xl border border-default-200 bg-white/70 dark:bg-default-100/40 p-4 space-y-2">
+              <div className="text-sm font-semibold">Shadowrocket 分流使用说明</div>
+              <p className="text-xs text-default-500">
+                将上方「Shadowrocket 分流配置」链接导入 Shadowrocket 的「配置」并设为使用中；它已包含节点和规则，无需再导入纯节点订阅。节点变更后重新下载配置。地区策略组按节点名称匹配，请在节点名标明 HK/JP/US 等地区；未匹配到的策略组需在 App 中手动选择可用节点。
+              </p>
+              <div className="flex gap-2">
+                <Button size="sm" variant="bordered" onPress={() => copyText(shadowrocketRulesUrl, "上游规则原址")}>
+                  复制上游规则原址（参考）
+                </Button>
+                <Button size="sm" variant="flat" onPress={() => window.open(shadowrocketRulesUrl, "_blank", "noopener,noreferrer")}>
+                  查看上游规则（不含节点）
+                </Button>
+              </div>
+              <Input readOnly aria-label="上游 Shadowrocket 规则原址（不含节点）" value={shadowrocketRulesUrl} />
+            </div>
           </CardBody>
         </Card>
 
@@ -196,13 +220,13 @@ export default function SubscriptionPage() {
             <CardBody className="space-y-3">
               <Button
                 variant="bordered"
-                onPress={() => window.open(links[2].url, "_blank")}
+                onPress={() => window.open(links.find((l) => l.key === "surge5")?.url || "", "_blank")}
               >
                 下载 Surge 5 配置
               </Button>
               <Button
                 variant="bordered"
-                onPress={() => window.open(links[3].url, "_blank")}
+                onPress={() => window.open(links.find((l) => l.key === "surge6")?.url || "", "_blank")}
               >
                 下载 Surge 6 配置
               </Button>

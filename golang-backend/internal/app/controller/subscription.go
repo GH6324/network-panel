@@ -92,6 +92,22 @@ func SubscriptionShadowrocket(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if c.Query("rules") == "1" {
+		if len(skipped) > 0 {
+			c.Data(http.StatusServiceUnavailable, "text/plain; charset=utf-8", []byte("ERROR: Shadowrocket rule config unavailable: skipped forwards"))
+			return
+		}
+		cfg, err := buildShadowrocketRuleConfig(items)
+		if err != nil {
+			c.Data(http.StatusServiceUnavailable, "text/plain; charset=utf-8", []byte("ERROR: Shadowrocket rule config unavailable: "+err.Error()))
+			return
+		}
+		c.Header("Cache-Control", "private, no-store")
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("subscription-userinfo", buildSubHeader(user.OutFlow, user.InFlow, user.Flow*1024*1024*1024, valOr0(user.ExpTime)/1000))
+		c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(cfg))
+		return
+	}
 	c.Header("subscription-userinfo", buildSubHeader(user.OutFlow, user.InFlow, user.Flow*1024*1024*1024, valOr0(user.ExpTime)/1000))
 	cfg := buildShadowrocket(items, skipped)
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(cfg))

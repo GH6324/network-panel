@@ -410,6 +410,25 @@ func TestSubscriptionItems_AnyTLSExpandByForwardEgresses(t *testing.T) {
 	if got["rare-aether-us"] != "2001:db8::11" {
 		t.Fatalf("rare-aether-us egress mismatch: %#v", got)
 	}
+
+	// The rule-enabled endpoint must return a complete profile for this user.
+	w = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/api/v1/subscription/shadowrocket?rules=1&token="+token, nil)
+	SubscriptionShadowrocket(c)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "[Proxy]\n") || !strings.Contains(w.Body.String(), "rare-aether-hk = anytls") || !strings.Contains(w.Body.String(), "FINAL,🐟 漏网之鱼") {
+		t.Fatalf("invalid personalized rule profile, status=%d body=%s", w.Code, w.Body.String())
+	}
+	if err := db.Model(&model.Forward{}).Where("id = ?", fwd.ID).Update("tunnel_id", 999).Error; err != nil {
+		t.Fatalf("invalidate tunnel: %v", err)
+	}
+	w = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/api/v1/subscription/shadowrocket?rules=1&token="+token, nil)
+	SubscriptionShadowrocket(c)
+	if w.Code != 503 || strings.Contains(w.Body.String(), "[Rule]") {
+		t.Fatalf("skipped forward must not yield a partial rule profile, status=%d", w.Code)
+	}
 }
 
 func TestSubscriptionItems_AnyTLSPortMappingEgressFallback(t *testing.T) {
